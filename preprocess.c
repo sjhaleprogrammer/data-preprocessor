@@ -16,10 +16,9 @@ void create_directory(const char *path) {
 
 // Function to process text with enhanced cleanup:
 // 1. Remove HTML tags
-// 2. Add newline after single periods (not ellipses)
-// 3. Remove sequences of @ characters and any spaces around them
-// 4. Normalize spacing around periods and commas
-// 5. Remove dashes with spaces (-- -- -- patterns)
+// 2. Remove sequences of @ characters and any spaces around them
+// 3. Normalize spacing around periods and commas
+// 4. Remove dashes with spaces (-- -- -- patterns)
 void process_text(char *input, char *output, size_t output_size) {
     int in_tag = 0;
     size_t output_index = 0;
@@ -81,12 +80,6 @@ void process_text(char *input, char *output, size_t output_size) {
                 
                 // Check if we just processed a period or comma and are now seeing spaces
                 if (output_index > 0 && (output[output_index-1] == '.' || output[output_index-1] == ',')) {
-                    // If it's a period and we're adding a newline, skip this space
-                    if (output[output_index-1] == '.' && 
-                        (input[i-1] == '.' && (input[i-2] != '.' && input[i] != '.'))) {
-                        continue;
-                    }
-                    
                     // If it's a comma, skip the space after it
                     if (output[output_index-1] == ',') {
                         continue;
@@ -101,97 +94,17 @@ void process_text(char *input, char *output, size_t output_size) {
             
             // Normal processing for other characters
             output[output_index++] = input[i];
-            
-            // Check if this is a single period, not part of an ellipsis
-            if (input[i] == '.' && 
-                (input[i+1] != '.' && input[i-1] != '.')) {
-                
-                // Check if the next character is already a newline
-                if (input[i+1] != '\n' && input[i+1] != '\r') {
-                    output[output_index++] = '\n';
-                }
-            }
         }
     }
     
     output[output_index] = '\0';
 }
 
-// Function to process a file and split text by @@NUMBER pattern into separate files
-void split_by_delimiter(FILE *input_file, const char *output_dir) {
-    char buffer[4096];  // Increased buffer size for longer lines
-    char processed_buffer[8192];  // Double size to accommodate added newlines
-    FILE *current_output = NULL;
-    char current_filename[256] = "";
-    
-    // Read the file line by line
-    while (fgets(buffer, sizeof(buffer), input_file) != NULL) {
-        // Check if the line contains the delimiter pattern
-        char *delimiter = strstr(buffer, "@@");
-        
-        if (delimiter != NULL && isdigit(*(delimiter + 2))) {
-            // Close previous output file if open
-            if (current_output != NULL) {
-                fclose(current_output);
-                current_output = NULL;
-            }
-            
-            // Extract the number following @@
-            char *number_start = delimiter + 2;
-            char *number_end = number_start;
-            
-            while (isdigit(*number_end)) {
-                number_end++;
-            }
-            
-            // Create a temporary string to hold just the number
-            size_t number_len = number_end - number_start;
-            char number[256];
-            if (number_len >= sizeof(number)) {
-                number_len = sizeof(number) - 1;
-            }
-            strncpy(number, number_start, number_len);
-            number[number_len] = '\0';
-            
-            // Create the new filename
-            snprintf(current_filename, sizeof(current_filename), 
-                     "%s/%s.txt", output_dir, number);
-            
-            // Open the new output file
-            current_output = fopen(current_filename, "w");
-            if (current_output == NULL) {
-                fprintf(stderr, "Error: Cannot create file %s\n", current_filename);
-                return;
-            }
-            
-            printf("Creating file: %s\n", current_filename);
-            
-            // Process and write the content after the delimiter to the file
-            char *content_after_delimiter = number_end;
-            process_text(content_after_delimiter, processed_buffer, sizeof(processed_buffer));
-            fprintf(current_output, "%s", processed_buffer);
-        } else if (current_output != NULL) {
-            // Process the line and write to the current output file
-            process_text(buffer, processed_buffer, sizeof(processed_buffer));
-            fprintf(current_output, "%s", processed_buffer);
-        }
-    }
-    
-    // Close the last output file if open
-    if (current_output != NULL) {
-        fclose(current_output);
-    }
-}
-
 int main(int argc, char *argv[]) {
-    if (argc != 2) {
-        fprintf(stderr, "Usage: %s <filename>\n", argv[0]);
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <input_filename> <output_filename>\n", argv[0]);
         return 1;
     }
-    
-    // Create the output directory
-    const char *output_dir = "processed";
-    create_directory(output_dir);
     
     FILE *input_file = fopen(argv[1], "r");
     if (input_file == NULL) {
@@ -199,10 +112,25 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     
-    split_by_delimiter(input_file, output_dir);
+    FILE *output_file = fopen(argv[2], "w");
+    if (output_file == NULL) {
+        fprintf(stderr, "Error: Cannot create output file %s\n", argv[2]);
+        fclose(input_file);
+        return 1;
+    }
+    
+    char buffer[4096];
+    char processed_buffer[8192];
+    
+    // Process the entire file
+    while (fgets(buffer, sizeof(buffer), input_file) != NULL) {
+        process_text(buffer, processed_buffer, sizeof(processed_buffer));
+        fprintf(output_file, "%s", processed_buffer);
+    }
     
     fclose(input_file);
-    printf("Processing complete. Files are in the '%s' directory.\n", output_dir);
+    fclose(output_file);
+    printf("Processing complete. Output saved to %s\n", argv[2]);
     
     return 0;
 }
