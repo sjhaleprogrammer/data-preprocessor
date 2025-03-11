@@ -21,11 +21,25 @@ def process_data(input_file, sources_file):
 
     # Create DataFrame from lines
     df_input = pd.DataFrame([line[2:].split(' ', 1) for line in lines], columns=['id', 'content'])
-    df_input['from'] = 'human'
     df_input['content'] = df_input['content'].apply(clean_text)
 
-    # Load sources data
-    sources_data = pd.read_csv(sources_file, sep='\s+', header=None, names=['id', 'year', 'magazine', 'pages', 'title'], engine='python')
+    # Load data from sources file
+    with open(sources_file, 'r') as f:
+        sources_data = []
+        for line in f:
+            parts = line.strip().split()
+            # Extract the first 5 fields
+            if len(parts) >= 6:
+                record = {
+                    'id': parts[0],
+                    'year': parts[1],
+                    'type': parts[2],
+                    'pages': parts[3],
+                    'source': parts[4],
+                    'title': ' '.join(parts[5:])  # Join remaining parts as title
+                }
+                sources_data.append(record)
+        sources_data = pd.DataFrame(sources_data)
 
     # Merge based on ID match (assuming IDs are integers or can be cast to integer)
     df_sources = sources_data.astype({'id': str})
@@ -34,10 +48,47 @@ def process_data(input_file, sources_file):
     # Prepare output structure
     result_list = []
     for index, row in merged_df.iterrows():
-        result_dict = {
-            "from": row['from'],
-            "value": f"***{row['content']}*** - Source: {row['title']}"
+        # Human entry
+        human_dict = {
+            "from": "human",
+            "value": f"{row['content']}"
         }
-        result_list.append(result_dict)
+        result_list.append(human_dict)
+
+        # GPT entry
+        gpt_dict = {
+            "from": "gpt",
+            "value": "Tell the user what dialect this is and provide additional context."
+        }
+        result_list.append(gpt_dict)
 
     return result_list
+
+
+def export_to_parquet(data, output_file):
+    # Convert list of dictionaries to DataFrame
+    df_output = pd.DataFrame(data)
+
+    # Save to Parquet
+    df_output.to_parquet(output_file, index=False)
+
+
+if __name__ == "__main__":
+
+    # Define input files
+    input_corpus = 'text_blog_01.txt'
+    sources_txt = 'sources.txt'
+
+    # Process data
+    processed_data = process_data(input_corpus, sources_txt)
+
+    #print(processed_data[0])
+    #print(processed_data[1])
+
+    # Export processed data to Parquet file
+    output_parquet_file = 'output.parquet'
+    export_to_parquet(processed_data, output_parquet_file)
+    
+    df = pd.read_parquet('output.parquet')
+
+    df.head(10)
