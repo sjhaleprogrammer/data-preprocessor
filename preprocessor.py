@@ -22,7 +22,7 @@ def clean_text(text: str) -> str:
     soup = BeautifulSoup(text, "html.parser")
     text = soup.get_text()
     # Remove unnecessary spaces around 's and n't
-    text = text.replace(" '", "'").replace(" n't", "n't").replace("@ @ @ @ @ @ @ @ @ @","").replace("\'t","'t")
+    text = text.replace(" '", "'").replace(" n't", "n't").replace("@ @ @ @ @ @ @ @ @ @","").replace("\\","")
     return text
 
 def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENCODINGS) -> Tuple[Optional[List[str]], str]:
@@ -140,7 +140,6 @@ def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
                 logger.warning(f"  ! SKIPPED: Could not process {file_path}")
                 skipped_files += 1
     
-    logger.info(f"\nSummary:")
     logger.info(f"- Processed {processed_files}/{total_files} files")
     logger.info(f"- Skipped {skipped_files} files")
     logger.info(f"- Total lines collected: {len(all_lines)}")
