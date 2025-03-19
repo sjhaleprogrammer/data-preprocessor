@@ -3,6 +3,8 @@ import pandas as pd
 import logging
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Optional, Tuple
+import re
+import functools
 
 # Set up logging
 logging.basicConfig(
@@ -14,30 +16,182 @@ logger = logging.getLogger(__name__)
 # Define constants
 ENCODINGS = ['utf-8', 'latin-1', 'cp1252']
 
-def clean_text(text: str) -> str:
-    """Clean text by removing markers and fixing formatting issues."""
-    # Remove multiple '@' characters
-    text = text.replace('@@', '')
-    # Replace HTML entities with spaces
-    soup = BeautifulSoup(text, "html.parser")
-    text = soup.get_text()
-    # Remove unnecessary spaces around 's and n't
-    text = text.replace(" '", "'").replace(" n't", "n't").replace("@ @ @ @ @ @ @ @ @ @","").replace("\\","")
-    return text
+# Precompile regular expressions for performance
+HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
+URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+\.[^\s<>"]+(?:/[^\s<>"]*)?')
+DOMAIN_PATTERN = re.compile(r'(?:https?://)?(?:www\.)?([^/\s<>"]+\.[^/\s<>"]+)')
+CITATION_PATTERN = re.compile(r'\*\*\d+;\d+;TOOLONG')
+REFERENCE_PATTERN = re.compile(r'\[\d+\]')
+POST_NUMBER_PATTERN = re.compile(r'#\d+\s*')
+TIMESTAMP_PATTERN = re.compile(r'\d+\s+(?:days?|hours?|minutes?|seconds?)\s+ago')
+ATTRIBUTION_PATTERN = re.compile(r'(?:Quote|Originally Posted by).*?(?=<p>|\n|$)')
+SIGNATURE_PATTERN = re.compile(r'(?:^|\n)(?:--|Regards,|Last edited by)[\s\w]+?(?=\n|$)')
+USERNAME_PATTERN = re.compile(r'^\s*[A-Za-z0-9_]+\s*$', flags=re.MULTILINE)
+WHITESPACE_PATTERN = re.compile(r'\s+')
 
-def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENCODINGS) -> Tuple[Optional[List[str]], str]:
+# Define contraction patterns
+CONTRACTION_PATTERNS = [
+    (re.compile(r'\s+n\'t'), "n't"),
+    (re.compile(r'\s+\'s'), "'s"),
+    (re.compile(r'\s+\'m'), "'m"),
+    (re.compile(r'\s+\'re'), "'re"),
+    (re.compile(r'\s+\'ve'), "'ve"),
+    (re.compile(r'\s+\'ll'), "'ll"),
+    (re.compile(r'\s+\'d'), "'d"),
+]
+
+# Define punctuation patterns
+PUNCTUATION_PATTERNS = [
+    (re.compile(r'\s+\,'), ","),
+    (re.compile(r'\s+\.'), "."),
+    (re.compile(r'\s+\:'), ":"),
+    (re.compile(r'\s+\;'), ";"),
+    (re.compile(r'\s+\?'), "?"),
+    (re.compile(r'\s+\!'), "!"),
+    (re.compile(r'\s+\)'), ")"),
+    (re.compile(r'\(\s+'), "("),
+]
+
+# HTML entities mapping
+HTML_ENTITIES = {
+    '&lt;': '<',
+    '&gt;': '>',
+    '&amp;': '&',
+    '&quot;': '"',
+    '&apos;': "'",
+    '&nbsp;': ' ',
+}
+
+# Use lru_cache for functions that might be called with the same inputs
+@functools.lru_cache(maxsize=1024)
+def fix_encoded_html(text):
     """
-    Try to read a file with multiple encodings.
+    Fix encoded HTML entities and remove HTML tags.
     
     Args:
-        file_path: Path to the file to read
-        encodings: List of encodings to try
+        text: The text to clean
         
     Returns:
-        Tuple containing:
-            - List of lines from the file or None if all encodings failed
-            - Encoding used (if successful)
+        Text with decoded and removed HTML
     """
+    # Skip if the text doesn't contain any encoded HTML entities
+    if not ('&lt;' in text or '&gt;' in text or '&amp;' in text):
+        return text
+        
+    # Replace HTML entities with their actual characters
+    for entity, char in HTML_ENTITIES.items():
+        text = text.replace(entity, char)
+    
+    # Now use BeautifulSoup to remove the HTML tags
+    return clean_html(text)
+
+def clean_html(text):
+    """
+    Remove HTML tags using BeautifulSoup or regex fallback.
+    
+    Args:
+        text: The text containing HTML tags
+    
+    Returns:
+        Text with HTML tags removed
+    """
+    # Skip processing if the text looks like a filename or path
+    if len(text) < 255 and ('\\' in text or '/' in text or '.' in text) and ' ' not in text:
+        return text
+        
+    # Check if there are any HTML-like tags in the text before using BeautifulSoup
+    if '<' in text and '>' in text:
+        try:
+            # Use BeautifulSoup to parse and remove HTML tags
+            soup = BeautifulSoup(text, 'html.parser')
+            return soup.get_text(' ', strip=True)
+        except Exception as e:
+            logger.warning(f"BeautifulSoup error: {str(e)}")
+            # Fall back to a simple regex-based approach
+            return HTML_TAG_PATTERN.sub('', text)
+    else:
+        # If no HTML-like content, return as is
+        return text
+
+def fix_contractions(text):
+    """Fix separated contractions like 'was n't' to 'wasn't'."""
+    for pattern, replacement in CONTRACTION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+def fix_punctuation(text):
+    """Fix separated punctuations like 'WORD ,' to 'WORD,'."""
+    for pattern, replacement in PUNCTUATION_PATTERNS:
+        text = pattern.sub(replacement, text)
+    return text
+
+def handle_numerical_citations(text):
+    """Handle numerical citations and special reference patterns."""
+    # Replace citation patterns
+    text = CITATION_PATTERN.sub('[citation]', text)
+    text = REFERENCE_PATTERN.sub('[reference]', text)
+    return text
+
+def handle_forum_content(text):
+    """Remove forum/blog-specific elements."""
+    text = POST_NUMBER_PATTERN.sub('', text)
+    text = TIMESTAMP_PATTERN.sub('', text)
+    text = ATTRIBUTION_PATTERN.sub('', text)
+    text = SIGNATURE_PATTERN.sub('', text)
+    text = USERNAME_PATTERN.sub('', text)
+    return text
+
+def truncate_urls(text):
+    """Truncate long URLs to just the domain name."""
+    def replace_url(match):
+        url = match.group(0)
+        domain_match = DOMAIN_PATTERN.search(url)
+        if domain_match:
+            domain = domain_match.group(1)
+            return f"www.{domain}"
+        return url
+    
+    return URL_PATTERN.sub(replace_url, text)
+
+def clean_text(text):
+    """
+    Clean text by applying all cleaning functions in sequence.
+    
+    Args:
+        text: The text to clean
+    
+    Returns:
+        Cleaned text
+    """
+    if not isinstance(text, str):
+        logger.warning(f"Non-string input to clean_text: {type(text)}")
+        return str(text)
+        
+    try:
+        # Replace Unicode replacement character
+        text = text.replace('\ufffd', '<unk>')
+        
+        # Apply cleaning steps in a logical sequence
+        text = fix_encoded_html(text)
+        text = clean_html(text)
+        text = handle_numerical_citations(text)
+        text = handle_forum_content(text)
+        text = fix_contractions(text)
+        text = fix_punctuation(text)
+        text = truncate_urls(text)
+        
+        # Normalize whitespace
+        text = text.strip()
+        text = WHITESPACE_PATTERN.sub(' ', text)
+        
+        return text
+    except Exception as e:
+        logger.error(f"Error during text cleaning: {str(e)}")
+        # Fallback: return ASCII characters only
+        return ''.join(c if c.isascii() else '<unk>' for c in str(text))
+
+def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENCODINGS) -> Tuple[Optional[List[str]], str]:
+    """Try to read a file with multiple encodings."""
     for encoding in encodings:
         try:
             with open(file_path, 'r', encoding=encoding) as f:
@@ -53,15 +207,7 @@ def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENC
     return None, ""
 
 def parse_sources_file(sources_file: str) -> pd.DataFrame:
-    """
-    Parse the sources file into a DataFrame.
-    
-    Args:
-        sources_file: Path to the sources file
-        
-    Returns:
-        DataFrame containing source information
-    """
+    """Parse the sources file into a DataFrame."""
     lines, _ = read_file_with_multiple_encodings(sources_file)
     if not lines:
         logger.error("Could not read sources file")
@@ -91,24 +237,15 @@ def parse_sources_file(sources_file: str) -> pd.DataFrame:
     return df
 
 def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
-    """
-    Walk through all subdirectories and collect lines starting with '@@'.
-    
-    Args:
-        input_folder: Path to the folder to search
-        
-    Returns:
-        List of dictionaries containing line content and metadata
-    """
+    """Walk through directories and collect lines starting with '@@'."""
     all_lines = []
     processed_files = 0
     skipped_files = 0
     total_files = 0
     sequence_counter = 0
     
-    # Sort directories and files for consistent processing order
+    # Process files in sorted order for consistency
     for root, dirs, files in sorted(os.walk(input_folder)):
-        # Sort files for consistent processing
         txt_files = sorted([f for f in files if f.endswith('.txt')])
         total_files += len(txt_files)
         logger.info(f"Found {len(txt_files)} .txt files in {root}")
@@ -119,7 +256,6 @@ def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
             
             content, encoding = read_file_with_multiple_encodings(file_path)
             if content:
-                # Process each line while tracking its order
                 matching_lines = []
                 for line_num, line in enumerate(content):
                     line = line.strip()
@@ -147,15 +283,7 @@ def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
     return all_lines
 
 def parse_content_lines(line_dicts: List[Dict[str, Any]]) -> pd.DataFrame:
-    """
-    Parse content lines into a DataFrame.
-    
-    Args:
-        line_dicts: List of dictionaries with line content and metadata
-        
-    Returns:
-        DataFrame with id, content, and ordering information
-    """
+    """Parse content lines into a DataFrame."""
     if not line_dicts:
         logger.warning("No content lines to parse")
         return pd.DataFrame()
@@ -180,7 +308,9 @@ def parse_content_lines(line_dicts: List[Dict[str, Any]]) -> pd.DataFrame:
         logger.warning("No valid data lines after parsing")
         return pd.DataFrame()
     
+    # Create DataFrame first, then apply cleaning function using pandas
     df = pd.DataFrame(rows)
+    logger.info("Cleaning text content...")
     df['content'] = df['content'].apply(clean_text)
     df = df.astype({'id': str})
     
@@ -188,15 +318,7 @@ def parse_content_lines(line_dicts: List[Dict[str, Any]]) -> pd.DataFrame:
     return df
 
 def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Format merged data for validation structure.
-    
-    Args:
-        merged_df: DataFrame with merged content and source information
-        
-    Returns:
-        List of dictionaries in validation format
-    """
+    """Format merged data for validation structure."""
     validation_format = []
     
     for _, row in merged_df.iterrows():
@@ -224,16 +346,7 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     return validation_format
 
 def process_data(input_folder: str, sources_file: str) -> List[Dict[str, Any]]:
-    """
-    Main data processing function.
-    
-    Args:
-        input_folder: Path to the input folder
-        sources_file: Path to the sources file
-        
-    Returns:
-        List of dictionaries in validation format
-    """
+    """Main data processing function."""
     # Parse sources file
     sources_df = parse_sources_file(sources_file)
     if sources_df.empty:
@@ -260,13 +373,7 @@ def process_data(input_folder: str, sources_file: str) -> List[Dict[str, Any]]:
     return format_for_validation(merged_df)
 
 def export_to_parquet(data: List[Dict[str, Any]], output_file: str) -> None:
-    """
-    Export data to a Parquet file.
-    
-    Args:
-        data: List of dictionaries to export
-        output_file: Path to the output file
-    """
+    """Export data to a Parquet file."""
     df_output = pd.DataFrame(data)
     df_output.to_parquet(output_file, index=False)
     logger.info(f"Exported {len(df_output)} records to {output_file}")
@@ -294,11 +401,7 @@ def main():
             logger.info("First record sample:")
             logger.info(df.iloc[0][0])
         
-        # Optional: Compare with validation data if available
-        validation_file = 'validation.parquet'
-        if os.path.exists(validation_file):
-            validation_df = pd.read_parquet(validation_file)
-            logger.info(f"Validation data has {len(validation_df)} records")
+       
     else:
         logger.error("No data to export")
 
