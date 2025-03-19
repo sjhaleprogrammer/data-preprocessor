@@ -1,10 +1,14 @@
-import os
+# File: text_processor.pyx
+
+import re
 import pandas as pd
 import logging
 from bs4 import BeautifulSoup
 from typing import List, Dict, Any, Optional, Tuple
-import re
+import os
 import functools
+import multiprocessing
+from multiprocessing import Pool, cpu_count
 
 # Set up logging
 logging.basicConfig(
@@ -17,17 +21,18 @@ logger = logging.getLogger(__name__)
 ENCODINGS = ['utf-8', 'latin-1', 'cp1252']
 
 # Precompile regular expressions for performance
-HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
-URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+\.[^\s<>"]+(?:/[^\s<>"]*)?')
-DOMAIN_PATTERN = re.compile(r'(?:https?://)?(?:www\.)?([^/\s<>"]+\.[^/\s<>"]+)')
-CITATION_PATTERN = re.compile(r'\*\*\d+;\d+;TOOLONG')
-REFERENCE_PATTERN = re.compile(r'\[\d+\]')
-POST_NUMBER_PATTERN = re.compile(r'#\d+\s*')
-TIMESTAMP_PATTERN = re.compile(r'\d+\s+(?:days?|hours?|minutes?|seconds?)\s+ago')
-ATTRIBUTION_PATTERN = re.compile(r'(?:Quote|Originally Posted by).*?(?=<p>|\n|$)')
-SIGNATURE_PATTERN = re.compile(r'(?:^|\n)(?:--|Regards,|Last edited by)[\s\w]+?(?=\n|$)')
-USERNAME_PATTERN = re.compile(r'^\s*[A-Za-z0-9_]+\s*$', flags=re.MULTILINE)
-WHITESPACE_PATTERN = re.compile(r'\s+')
+cdef:
+    object HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
+    object URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+\.[^\s<>"]+(?:/[^\s<>"]*)?')
+    object DOMAIN_PATTERN = re.compile(r'(?:https?://)?(?:www\.)?([^/\s<>"]+\.[^/\s<>"]+)')
+    object CITATION_PATTERN = re.compile(r'\*\*\d+;\d+;TOOLONG')
+    object REFERENCE_PATTERN = re.compile(r'\[\d+\]')
+    object POST_NUMBER_PATTERN = re.compile(r'#\d+\s*')
+    object TIMESTAMP_PATTERN = re.compile(r'\d+\s+(?:days?|hours?|minutes?|seconds?)\s+ago')
+    object ATTRIBUTION_PATTERN = re.compile(r'(?:Quote|Originally Posted by).*?(?=<p>|\n|$)')
+    object SIGNATURE_PATTERN = re.compile(r'(?:^|\n)(?:--|Regards,|Last edited by)[\s\w]+?(?=\n|$)')
+    object USERNAME_PATTERN = re.compile(r'^\s*[A-Za-z0-9_]+\s*$', flags=re.MULTILINE)
+    object WHITESPACE_PATTERN = re.compile(r'\s+')
 
 # Define contraction patterns
 CONTRACTION_PATTERNS = [
@@ -64,7 +69,7 @@ HTML_ENTITIES = {
 
 # Use lru_cache for functions that might be called with the same inputs
 @functools.lru_cache(maxsize=1024)
-def fix_encoded_html(text):
+def fix_encoded_html(str text):
     """
     Fix encoded HTML entities and remove HTML tags.
     
@@ -85,7 +90,7 @@ def fix_encoded_html(text):
     # Now use BeautifulSoup to remove the HTML tags
     return clean_html(text)
 
-def clean_html(text):
+def clean_html(str text):
     """
     Remove HTML tags using BeautifulSoup or regex fallback.
     
@@ -113,26 +118,34 @@ def clean_html(text):
         # If no HTML-like content, return as is
         return text
 
-def fix_contractions(text):
+def fix_contractions(str text):
     """Fix separated contractions like 'was n't' to 'wasn't'."""
+    cdef:
+        object pattern
+        str replacement
+    
     for pattern, replacement in CONTRACTION_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
 
-def fix_punctuation(text):
+def fix_punctuation(str text):
     """Fix separated punctuations like 'WORD ,' to 'WORD,'."""
+    cdef:
+        object pattern
+        str replacement
+    
     for pattern, replacement in PUNCTUATION_PATTERNS:
         text = pattern.sub(replacement, text)
     return text
 
-def handle_numerical_citations(text):
+def handle_numerical_citations(str text):
     """Handle numerical citations and special reference patterns."""
     # Replace citation patterns
     text = CITATION_PATTERN.sub('[citation]', text)
     text = REFERENCE_PATTERN.sub('[reference]', text)
     return text
 
-def handle_forum_content(text):
+def handle_forum_content(str text):
     """Remove forum/blog-specific elements."""
     text = POST_NUMBER_PATTERN.sub('', text)
     text = TIMESTAMP_PATTERN.sub('', text)
@@ -141,7 +154,7 @@ def handle_forum_content(text):
     text = USERNAME_PATTERN.sub('', text)
     return text
 
-def truncate_urls(text):
+def truncate_urls(str text):
     """Truncate long URLs to just the domain name."""
     def replace_url(match):
         url = match.group(0)
@@ -153,7 +166,7 @@ def truncate_urls(text):
     
     return URL_PATTERN.sub(replace_url, text)
 
-def clean_text(text):
+def clean_text(object text_obj):
     """
     Clean text by applying all cleaning functions in sequence.
     
@@ -163,9 +176,13 @@ def clean_text(text):
     Returns:
         Cleaned text
     """
-    if not isinstance(text, str):
-        logger.warning(f"Non-string input to clean_text: {type(text)}")
-        return str(text)
+    cdef str text
+    
+    if not isinstance(text_obj, str):
+        logger.warning(f"Non-string input to clean_text: {type(text_obj)}")
+        text = str(text_obj)
+    else:
+        text = text_obj
         
     try:
         # Replace Unicode replacement character
@@ -190,12 +207,20 @@ def clean_text(text):
         # Fallback: return ASCII characters only
         return ''.join(c if c.isascii() else '<unk>' for c in str(text))
 
-def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENCODINGS) -> Tuple[Optional[List[str]], str]:
+def read_file_with_multiple_encodings(str file_path, list encodings=None):
     """Try to read a file with multiple encodings."""
+    cdef:
+        str encoding
+        list lines
+    
+    if encodings is None:
+        encodings = ENCODINGS
+    
     for encoding in encodings:
         try:
             with open(file_path, 'r', encoding=encoding) as f:
-                return f.readlines(), encoding
+                lines = f.readlines()
+                return lines, encoding
         except UnicodeDecodeError:
             logger.debug(f"Failed to decode {file_path} with {encoding}")
             continue
@@ -206,14 +231,20 @@ def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = ENC
     logger.warning(f"Could not decode {file_path} with any encoding")
     return None, ""
 
-def parse_sources_file(sources_file: str) -> pd.DataFrame:
+def parse_sources_file(str sources_file):
     """Parse the sources file into a DataFrame."""
+    cdef:
+        list lines
+        str line
+        list parts
+        dict record
+        list sources_data = []
+    
     lines, _ = read_file_with_multiple_encodings(sources_file)
     if not lines:
         logger.error("Could not read sources file")
         return pd.DataFrame()
     
-    sources_data = []
     for line in lines:
         parts = line.strip().split()
         if len(parts) >= 6:
@@ -236,45 +267,93 @@ def parse_sources_file(sources_file: str) -> pd.DataFrame:
     
     return df
 
-def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
-    """Walk through directories and collect lines starting with '@@'."""
-    all_lines = []
-    processed_files = 0
-    skipped_files = 0
-    total_files = 0
-    sequence_counter = 0
+def process_file(tuple file_info):
+    """Process a single file and return content lines."""
+    cdef:
+        str root_dir = file_info[0]
+        str filename = file_info[1]
+        int file_order = file_info[2]
+        int start_sequence = file_info[3]
+        str file_path
+        list content
+        str encoding
+        list matching_lines = []
+        list result_lines = []
+        int line_num
+        str line
+        int sequence_counter = 0
     
-    # Process files in sorted order for consistency
+    file_path = os.path.join(root_dir, filename)
+    
+    try:
+        logger.info(f"Processing {file_path}...")
+        content, encoding = read_file_with_multiple_encodings(file_path)
+        
+        if content:
+            for line_num, line in enumerate(content):
+                line = line.strip()
+                if line.startswith('@@'):
+                    sequence_counter += 1
+                    matching_lines.append(line)
+                    result_lines.append({
+                        'line': line,
+                        'file': file_path,
+                        'file_order': file_order,
+                        'line_num': line_num,
+                        'sequence': start_sequence + sequence_counter
+                    })
+            
+            logger.info(f"  - Found {len(matching_lines)} lines starting with @@ using {encoding} encoding")
+            return True, result_lines
+        else:
+            logger.warning(f"  ! Could not process {file_path}")
+            return False, []
+    except Exception as e:
+        logger.error(f"Error processing {file_path}: {str(e)}")
+        return False, []
+
+def collect_content_lines_parallel(str input_folder, int num_workers=0):
+    """Walk through directories and collect lines starting with '@@' using parallel processing."""
+    if num_workers is 0:
+        num_workers = max(1, cpu_count() - 1)  # Leave one CPU for system
+    
+    logger.info(f"Using {num_workers} worker processes")
+    
+    # Get all text files and prepare for parallel processing
+    cdef:
+        list file_infos = []
+        int file_order = 0
+        int total_files = 0
+        str root
+    
     for root, dirs, files in sorted(os.walk(input_folder)):
         txt_files = sorted([f for f in files if f.endswith('.txt')])
         total_files += len(txt_files)
-        logger.info(f"Found {len(txt_files)} .txt files in {root}")
         
         for filename in txt_files:
-            file_path = os.path.join(root, filename)
-            logger.info(f"Processing {file_path}...")
-            
-            content, encoding = read_file_with_multiple_encodings(file_path)
-            if content:
-                matching_lines = []
-                for line_num, line in enumerate(content):
-                    line = line.strip()
-                    if line.startswith('@@'):
-                        sequence_counter += 1
-                        matching_lines.append(line)
-                        all_lines.append({
-                            'line': line,
-                            'file': file_path,
-                            'file_order': processed_files,
-                            'line_num': line_num,
-                            'sequence': sequence_counter
-                        })
-                
-                logger.info(f"  - Found {len(matching_lines)} lines starting with @@ using {encoding} encoding")
+            # Root dir, filename, file order, starting sequence number
+            file_infos.append((root, filename, file_order, file_order * 10000))
+            file_order += 1
+    
+    logger.info(f"Found {total_files} .txt files to process")
+    
+    # Process files in parallel
+    all_lines = []
+    processed_files = 0
+    skipped_files = 0
+    
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(process_file, file_infos)
+        
+        for success, lines in results:
+            if success:
+                all_lines.extend(lines)
                 processed_files += 1
             else:
-                logger.warning(f"  ! SKIPPED: Could not process {file_path}")
                 skipped_files += 1
+    
+    # Sort lines by sequence to ensure correct order
+    all_lines.sort(key=lambda x: x['sequence'])
     
     logger.info(f"- Processed {processed_files}/{total_files} files")
     logger.info(f"- Skipped {skipped_files} files")
@@ -282,44 +361,65 @@ def collect_content_lines(input_folder: str) -> List[Dict[str, Any]]:
     
     return all_lines
 
-def parse_content_lines(line_dicts: List[Dict[str, Any]]) -> pd.DataFrame:
-    """Parse content lines into a DataFrame."""
-    if not line_dicts:
-        logger.warning("No content lines to parse")
-        return pd.DataFrame()
+def process_content_batch(list batch):
+    """Process a batch of content lines."""
+    cdef:
+        list rows = []
+        dict line_dict
+        str line
+        list parts
     
-    rows = []
-    for line_dict in line_dicts:
+    for line_dict in batch:
         line = line_dict['line']
         parts = line[2:].split(' ', 1)  # Skip the '@@' prefix
         if len(parts) == 2:
             rows.append({
                 'id': parts[0],
-                'content': parts[1],
+                'content': clean_text(parts[1]),  # Apply cleaning during processing
                 'file': line_dict['file'],
                 'file_order': line_dict['file_order'],
                 'line_num': line_dict['line_num'],
                 'sequence': line_dict['sequence']
             })
-        else:
-            logger.warning(f"Skipping invalid line: {line}")
     
-    if not rows:
+    return rows
+
+def parse_content_lines_parallel(list line_dicts, int batch_size=1000, int num_workers=0):
+    """Parse content lines into a DataFrame using parallel processing."""
+    if not line_dicts:
+        logger.warning("No content lines to parse")
+        return pd.DataFrame()
+    
+    if num_workers is 0:
+        num_workers = max(1, cpu_count() - 1)  # Leave one CPU for system
+    
+    # Split lines into batches for parallel processing
+    batches = [line_dicts[i:i+batch_size] for i in range(0, len(line_dicts), batch_size)]
+    logger.info(f"Processing {len(batches)} batches with {num_workers} workers")
+    
+    # Process batches in parallel
+    all_rows = []
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(process_content_batch, batches)
+        for batch_rows in results:
+            all_rows.extend(batch_rows)
+    
+    if not all_rows:
         logger.warning("No valid data lines after parsing")
         return pd.DataFrame()
     
-    # Create DataFrame first, then apply cleaning function using pandas
-    df = pd.DataFrame(rows)
-    logger.info("Cleaning text content...")
-    df['content'] = df['content'].apply(clean_text)
+    # Create DataFrame from processed rows
+    df = pd.DataFrame(all_rows)
     df = df.astype({'id': str})
     
     logger.info(f"Parsed {len(df)} valid content lines")
     return df
 
-def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
+def format_for_validation(object merged_df):
     """Format merged data for validation structure."""
-    validation_format = []
+    cdef:
+        list validation_format = []
+        list conversation
     
     for _, row in merged_df.iterrows():
         conversation = [
@@ -345,20 +445,20 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     
     return validation_format
 
-def process_data(input_folder: str, sources_file: str) -> List[Dict[str, Any]]:
-    """Main data processing function."""
+def process_data(str input_folder, str sources_file, int num_workers=0):
+    """Main data processing function with parallel processing."""
     # Parse sources file
     sources_df = parse_sources_file(sources_file)
     if sources_df.empty:
         return []
     
-    # Collect content lines with sequence information
-    all_line_dicts = collect_content_lines(input_folder)
+    # Collect content lines with sequence information using parallel processing
+    all_line_dicts = collect_content_lines_parallel(input_folder, num_workers)
     if not all_line_dicts:
         return []
     
-    # Parse content lines
-    content_df = parse_content_lines(all_line_dicts)
+    # Parse content lines using parallel processing
+    content_df = parse_content_lines_parallel(all_line_dicts, num_workers=num_workers)
     if content_df.empty:
         return []
     
@@ -372,7 +472,7 @@ def process_data(input_folder: str, sources_file: str) -> List[Dict[str, Any]]:
     # Format for validation
     return format_for_validation(merged_df)
 
-def export_to_parquet(data: List[Dict[str, Any]], output_file: str) -> None:
+def export_to_parquet(list data, str output_file):
     """Export data to a Parquet file."""
     df_output = pd.DataFrame(data)
     df_output.to_parquet(output_file, index=False)
@@ -385,8 +485,12 @@ def main():
     sources_txt = 'sources.txt'
     output_parquet_file = 'output.parquet'
     
-    # Process data
-    processed_data = process_data(input_folder, sources_txt)
+    # Determine optimal number of workers
+    num_workers = max(1, cpu_count() - 1)  # Leave one CPU for system
+    logger.info(f"Using {num_workers} worker processes")
+    
+    # Process data with parallel processing
+    processed_data = process_data(input_folder, sources_txt, num_workers)
     
     # Export processed data
     if processed_data:
@@ -400,10 +504,10 @@ def main():
         if not df.empty:
             logger.info("First record sample:")
             logger.info(df.iloc[0][0])
-        
-       
     else:
         logger.error("No data to export")
 
 if __name__ == "__main__":
+    # Set multiprocessing start method
+    multiprocessing.set_start_method('spawn', force=True)
     main()
