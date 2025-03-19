@@ -1,0 +1,3 @@
+import preprocessor
+
+preprocessor.main()

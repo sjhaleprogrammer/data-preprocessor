@@ -6,6 +6,8 @@ pkgs.mkShell {
       pandas
       beautifulsoup4
       pyarrow
+      cython
+      setuptools
       # Add other Python packages here
     ]))
   ];
