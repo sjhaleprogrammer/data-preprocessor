@@ -20,7 +20,14 @@ logger = logging.getLogger(__name__)
 # Define constants
 ENCODINGS = ['utf-8', 'latin-1', 'cp1252']
 
-# Precompile regular expressions for performance
+
+
+##############################################################################
+
+
+#cleaning stage 
+
+
 cdef:
     object HTML_TAG_PATTERN = re.compile(r'<[^>]+>')
     object URL_PATTERN = re.compile(r'https?://[^\s<>"]+|www\.[^\s<>"]+\.[^\s<>"]+(?:/[^\s<>"]*)?')
@@ -33,32 +40,12 @@ cdef:
     object SIGNATURE_PATTERN = re.compile(r'(?:^|\n)(?:--|Regards,|Last edited by)[\s\w]+?(?=\n|$)')
     object USERNAME_PATTERN = re.compile(r'^\s*[A-Za-z0-9_]+\s*$', flags=re.MULTILINE)
     object WHITESPACE_PATTERN = re.compile(r'\s+')
-
-# Define contraction patterns
-CONTRACTION_PATTERNS = [
-    (re.compile(r'\s+n\'t'), "n't"),
-    (re.compile(r'\s+\'s'), "'s"),
-    (re.compile(r'\s+\'m'), "'m"),
-    (re.compile(r'\s+\'re'), "'re"),
-    (re.compile(r'\s+\'ve'), "'ve"),
-    (re.compile(r'\s+\'ll'), "'ll"),
-    (re.compile(r'\s+\'d'), "'d"),
-]
-
-# Define punctuation patterns
-PUNCTUATION_PATTERNS = [
-    (re.compile(r'\s+\,'), ","),
-    (re.compile(r'\s+\.'), "."),
-    (re.compile(r'\s+\:'), ":"),
-    (re.compile(r'\s+\;'), ";"),
-    (re.compile(r'\s+\?'), "?"),
-    (re.compile(r'\s+\!'), "!"),
-    (re.compile(r'\s+\)'), ")"),
-    (re.compile(r'\(\s+'), "("),
-]
+    object AT_SYMBOL_PATTERN = re.compile(r'\s@{2,}\s')
+    object CONTRACTION_PATTERN = re.compile(r'\s+(n\'t|\'s|\'m|\'re|\'ve|\'ll|\'d)')
+    object PUNCTUATION_PATTERN = re.compile(r'(\s+[\,\.\:\;\?\!\)]|\(\s+)')
 
 # HTML entities mapping
-HTML_ENTITIES = {
+cdef dict HTML_ENTITIES = {
     '&lt;': '<',
     '&gt;': '>',
     '&amp;': '&',
@@ -67,145 +54,178 @@ HTML_ENTITIES = {
     '&nbsp;': ' ',
 }
 
-# Use lru_cache for functions that might be called with the same inputs
-@functools.lru_cache(maxsize=1024)
-def fix_encoded_html(str text):
-    """
-    Fix encoded HTML entities and remove HTML tags.
-    
-    Args:
-        text: The text to clean
-        
-    Returns:
-        Text with decoded and removed HTML
-    """
-    # Skip if the text doesn't contain any encoded HTML entities
-    if not ('&lt;' in text or '&gt;' in text or '&amp;' in text):
-        return text
-        
-    # Replace HTML entities with their actual characters
-    for entity, char in HTML_ENTITIES.items():
-        text = text.replace(entity, char)
-    
-    # Now use BeautifulSoup to remove the HTML tags
-    return clean_html(text)
-
-def clean_html(str text):
-    """
-    Remove HTML tags using BeautifulSoup or regex fallback.
-    
-    Args:
-        text: The text containing HTML tags
-    
-    Returns:
-        Text with HTML tags removed
-    """
-    # Skip processing if the text looks like a filename or path
-    if len(text) < 255 and ('\\' in text or '/' in text or '.' in text) and ' ' not in text:
-        return text
-        
-    # Check if there are any HTML-like tags in the text before using BeautifulSoup
-    if '<' in text and '>' in text:
-        try:
-            # Use BeautifulSoup to parse and remove HTML tags
-            soup = BeautifulSoup(text, 'html.parser')
-            return soup.get_text(' ', strip=True)
-        except Exception as e:
-            logger.warning(f"BeautifulSoup error: {str(e)}")
-            # Fall back to a simple regex-based approach
-            return HTML_TAG_PATTERN.sub('', text)
-    else:
-        # If no HTML-like content, return as is
-        return text
-
-def fix_contractions(str text):
-    """Fix separated contractions like 'was n't' to 'wasn't'."""
+# Define helper functions outside of the main function to avoid closure issues
+cdef str _fix_punctuation(str text, object pattern):
+    """Fix punctuation without using lambda functions."""
     cdef:
-        object pattern
-        str replacement
-    
-    for pattern, replacement in CONTRACTION_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+        object match
+        str result = text
+        str matched_text, replacement
+        
+    for match in pattern.finditer(text):
+        matched_text = match.group(0)
+        if matched_text.startswith('('):
+            replacement = matched_text.strip()
+        else:
+            replacement = matched_text[-1]
+        result = result.replace(matched_text, replacement, 1)
+    return result
 
-def fix_punctuation(str text):
-    """Fix separated punctuations like 'WORD ,' to 'WORD,'."""
+cdef str _replace_url(str url):
+    """Extract domain from URL."""
     cdef:
-        object pattern
-        str replacement
+        object domain_match
+        str domain
     
-    for pattern, replacement in PUNCTUATION_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+    domain_match = DOMAIN_PATTERN.search(url)
+    if domain_match:
+        domain = domain_match.group(1)
+        return "www." + domain
+    return url
 
-def handle_numerical_citations(str text):
-    """Handle numerical citations and special reference patterns."""
-    # Replace citation patterns
-    text = CITATION_PATTERN.sub('[citation]', text)
-    text = REFERENCE_PATTERN.sub('[reference]', text)
-    return text
-
-def handle_forum_content(str text):
-    """Remove forum/blog-specific elements."""
-    text = POST_NUMBER_PATTERN.sub('', text)
-    text = TIMESTAMP_PATTERN.sub('', text)
-    text = ATTRIBUTION_PATTERN.sub('', text)
-    text = SIGNATURE_PATTERN.sub('', text)
-    text = USERNAME_PATTERN.sub('', text)
-    return text
-
-def truncate_urls(str text):
-    """Truncate long URLs to just the domain name."""
-    def replace_url(match):
+cdef str _truncate_urls(str text):
+    """Truncate all URLs in text."""
+    cdef:
+        object match
+        str result = text
+        str url, replacement
+    
+    for match in URL_PATTERN.finditer(text):
         url = match.group(0)
-        domain_match = DOMAIN_PATTERN.search(url)
-        if domain_match:
-            domain = domain_match.group(1)
-            return f"www.{domain}"
-        return url
-    
-    return URL_PATTERN.sub(replace_url, text)
+        replacement = _replace_url(url)
+        result = result.replace(url, replacement, 1)
+    return result
 
-def clean_text(object text_obj):
+cdef str _fix_contractions(str text):
+    """Fix contractions without using lambda."""
+    cdef:
+        object match
+        str result = text
+        str matched_text, replacement
+        
+    for match in CONTRACTION_PATTERN.finditer(text):
+        matched_text = match.group(0)
+        replacement = match.group(1)
+        result = result.replace(matched_text, replacement, 1)
+    return result
+
+# Use Python function with decorator, calling the Cython implementation
+@functools.lru_cache(maxsize=1024)
+def clean_text_cached(object text_obj):
+    """Cached wrapper for the Cython clean_text function."""
+    return _clean_text(text_obj)
+
+# The actual Cython implementation
+cdef str _clean_text(object text_obj):
     """
-    Clean text by applying all cleaning functions in sequence.
+    Clean text by applying all cleaning operations in a single optimized function.
     
     Args:
-        text: The text to clean
-    
+        text_obj: The text to clean
+        
     Returns:
         Cleaned text
     """
-    cdef str text
+    cdef:
+        str text
+        bint has_html_entities
+        str entity, char
+        int i, n
+        str c, result
     
+    # Convert to string if needed
     if not isinstance(text_obj, str):
-        logger.warning(f"Non-string input to clean_text: {type(text_obj)}")
-        text = str(text_obj)
+        try:
+            text = str(text_obj)
+        except Exception:
+            # logger.warning("Non-string input to clean_text")
+            return "<error_converting_text>"
     else:
         text = text_obj
-        
+    
     try:
         # Replace Unicode replacement character
         text = text.replace('\ufffd', '<unk>')
         
-        # Apply cleaning steps in a logical sequence
-        text = fix_encoded_html(text)
-        text = clean_html(text)
-        text = handle_numerical_citations(text)
-        text = handle_forum_content(text)
-        text = fix_contractions(text)
-        text = fix_punctuation(text)
-        text = truncate_urls(text)
+        # Replace sequences of @ symbols with <unk>
+        text = AT_SYMBOL_PATTERN.sub('<unk>', text)
         
-        # Normalize whitespace
+        # Quick check for HTML entities
+        has_html_entities = ('&lt;' in text or '&gt;' in text or '&amp;' in text or 
+                            '&quot;' in text or '&apos;' in text or '&nbsp;' in text)
+        
+        # Process HTML entities if present
+        if has_html_entities:
+            for entity, char in HTML_ENTITIES.items():
+                text = text.replace(entity, char)
+        
+        # Clean HTML tags if present (avoid BeautifulSoup overhead when possible)
+        if '<' in text and '>' in text:
+            # Skip processing if text looks like a filename or path
+            if not (len(text) < 255 and ('\\' in text or '/' in text or '.' in text) and ' ' not in text):
+                try:
+                    soup = BeautifulSoup(text, 'html.parser')
+                    text = soup.get_text(' ', strip=True)
+                except Exception:
+                    # Fall back to regex for HTML cleaning
+                    text = HTML_TAG_PATTERN.sub('', text)
+        
+        # Handle citations and references
+        text = CITATION_PATTERN.sub('[citation]', text)
+        text = REFERENCE_PATTERN.sub('[reference]', text)
+        
+        # Handle forum content
+        text = POST_NUMBER_PATTERN.sub('', text)
+        text = TIMESTAMP_PATTERN.sub('', text)
+        text = ATTRIBUTION_PATTERN.sub('', text)
+        text = SIGNATURE_PATTERN.sub('', text)
+        text = USERNAME_PATTERN.sub('', text)
+        
+        # Fix contractions (using helper function instead of lambda)
+        text = _fix_contractions(text)
+        
+        # Fix punctuation (using helper function instead of lambda)
+        text = _fix_punctuation(text, PUNCTUATION_PATTERN)
+        
+        # Truncate URLs (using helper function instead of lambda)
+        text = _truncate_urls(text)
+        
+        # Normalize whitespace (do this last)
         text = text.strip()
         text = WHITESPACE_PATTERN.sub(' ', text)
         
+        print(text)
         return text
-    except Exception as e:
-        logger.error(f"Error during text cleaning: {str(e)}")
+    except Exception:
         # Fallback: return ASCII characters only
-        return ''.join(c if c.isascii() else '<unk>' for c in str(text))
+        result = ""
+        n = len(text_obj)
+        for i in range(n):
+            c = text_obj[i]
+            if c.isascii():
+                result += c
+            else:
+                result += '<unk>'
+        return result
+
+# Public function that users will call
+def clean_text(object text_obj):
+    """
+    Clean text by applying various text cleaning operations.
+    This is the public API that calls the cached implementation.
+    
+    Args:
+        text_obj: The text to clean
+        
+    Returns:
+        Cleaned text
+    """
+    return clean_text_cached(text_obj)
+
+
+################################################################################################################
+
+
 
 def read_file_with_multiple_encodings(str file_path, list encodings=None):
     """Try to read a file with multiple encodings."""
