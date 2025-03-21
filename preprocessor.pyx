@@ -9,6 +9,7 @@ import os
 import functools
 import multiprocessing
 from multiprocessing import Pool, cpu_count
+import platform
 
 # Set up logging
 logging.basicConfig(
@@ -194,7 +195,6 @@ cdef str _clean_text(object text_obj):
         text = text.strip()
         text = WHITESPACE_PATTERN.sub(' ', text)
         
-        print(text)
         return text
     except Exception:
         # Fallback: return ASCII characters only
@@ -334,7 +334,7 @@ def process_file(tuple file_info):
 
 def collect_content_lines_parallel(str input_folder, int num_workers=0):
     """Walk through directories and collect lines starting with '@@' using parallel processing."""
-    if num_workers is 0:
+    if num_workers == 0:  # Fixed comparison (was using 'is')
         num_workers = max(1, cpu_count() - 1)  # Leave one CPU for system
     
     logger.info(f"Using {num_workers} worker processes")
@@ -362,15 +362,30 @@ def collect_content_lines_parallel(str input_folder, int num_workers=0):
     processed_files = 0
     skipped_files = 0
     
-    with Pool(processes=num_workers) as pool:
-        results = pool.map(process_file, file_infos)
-        
-        for success, lines in results:
-            if success:
-                all_lines.extend(lines)
-                processed_files += 1
-            else:
-                skipped_files += 1
+    # Choose appropriate multiprocessing approach based on OS
+    if platform.system() == 'Windows':
+        # Use a more Windows-friendly approach with chunksize
+        with Pool(processes=num_workers) as pool:
+            chunk_size = max(1, len(file_infos) // (num_workers * 4))  # Smaller chunks for better distribution
+            results = pool.map(process_file, file_infos, chunksize=chunk_size)
+            
+            for success, lines in results:
+                if success:
+                    all_lines.extend(lines)
+                    processed_files += 1
+                else:
+                    skipped_files += 1
+    else:
+        # Original approach for Unix systems
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(process_file, file_infos)
+            
+            for success, lines in results:
+                if success:
+                    all_lines.extend(lines)
+                    processed_files += 1
+                else:
+                    skipped_files += 1
     
     # Sort lines by sequence to ensure correct order
     all_lines.sort(key=lambda x: x['sequence'])
@@ -410,7 +425,7 @@ def parse_content_lines_parallel(list line_dicts, int batch_size=1000, int num_w
         logger.warning("No content lines to parse")
         return pd.DataFrame()
     
-    if num_workers is 0:
+    if num_workers == 0:  # Fixed comparison (was using 'is')
         num_workers = max(1, cpu_count() - 1)  # Leave one CPU for system
     
     # Split lines into batches for parallel processing
@@ -419,10 +434,21 @@ def parse_content_lines_parallel(list line_dicts, int batch_size=1000, int num_w
     
     # Process batches in parallel
     all_rows = []
-    with Pool(processes=num_workers) as pool:
-        results = pool.map(process_content_batch, batches)
-        for batch_rows in results:
-            all_rows.extend(batch_rows)
+    
+    # Choose appropriate multiprocessing approach based on OS
+    if platform.system() == 'Windows':
+        # Windows-friendly approach with chunksize
+        with Pool(processes=num_workers) as pool:
+            chunk_size = max(1, len(batches) // (num_workers * 4))
+            results = pool.map(process_content_batch, batches, chunksize=chunk_size)
+            for batch_rows in results:
+                all_rows.extend(batch_rows)
+    else:
+        # Original approach for Unix systems
+        with Pool(processes=num_workers) as pool:
+            results = pool.map(process_content_batch, batches)
+            for batch_rows in results:
+                all_rows.extend(batch_rows)
     
     if not all_rows:
         logger.warning("No valid data lines after parsing")
@@ -528,6 +554,17 @@ def main():
         logger.error("No data to export")
 
 if __name__ == "__main__":
-    # Set multiprocessing start method
-    multiprocessing.set_start_method('spawn', force=True)
+    # Set multiprocessing start method based on platform
+    if platform.system() == 'Windows':
+        # Windows requires 'spawn' method
+        multiprocessing.set_start_method('spawn', force=True)
+    else:
+        # Unix systems can use 'spawn' or 'fork' (spawn is safer)
+        # fork-based methods can create issues with resources
+        try:
+            multiprocessing.set_start_method('spawn', force=True)
+        except RuntimeError:
+            # Fallback if spawn is not available
+            logger.warning("Could not set 'spawn' method, using default method")
+    
     main()
