@@ -363,12 +363,15 @@ def main():
         logger.error("No data to export")
 
 if __name__ == "__main__":
-    # Set multiprocessing start method
-    if platform.system() == "Linux":
-        multiprocessing.set_start_method('spawn', force=True)
-        main()
-
-    elif platform.system() == "Darwin": 
+    if platform.system() == "Windows":
+        # Windows requires 'spawn' method
         multiprocessing.freeze_support()
         multiprocessing.set_start_method('spawn', force=True)
-        preprocessor.main()
+        main()
+    elif platform.system() == "Darwin":
+        multiprocessing.freeze_support()
+        multiprocessing.set_start_method('spawn', force=True)
+        main()  # Just call main() directly, not preprocessor.main()
+    else:
+        # Linux and other platforms
+        main()
