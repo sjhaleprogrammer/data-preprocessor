@@ -9,6 +9,8 @@ import os
 import functools
 import multiprocessing
 from multiprocessing import Pool, cpu_count
+import parallel_utils
+import platform
 
 # Set up logging
 logging.basicConfig(
@@ -195,6 +197,25 @@ def collect_content_lines_parallel(str input_folder, int num_workers=0):
     
     return all_lines
 
+
+'''
+def collect_content_lines_parallel(input_folder, num_workers):
+    file_infos = get_file_infos(input_folder)
+    if not file_infos:
+        return []
+    # Use the Python module for parallel processing
+    results = parallel_utils.parallel_map(process_file, file_infos, num_workers)
+    return results
+
+
+ 
+def parallel_map(func, items, num_workers):
+    """Process items in parallel using Pool."""
+    with Pool(processes=num_workers) as pool:
+        results = pool.map(func, items)
+    return results
+''' 
+
 def process_content_batch(list batch):
     """Process a batch of content lines."""
     cdef:
@@ -343,5 +364,11 @@ def main():
 
 if __name__ == "__main__":
     # Set multiprocessing start method
-    multiprocessing.set_start_method('spawn', force=True)
-    main()
+    if platform.system() == "Linux":
+        multiprocessing.set_start_method('spawn', force=True)
+        main()
+
+    elif platform.system() == "Darwin": 
+        multiprocessing.freeze_support()
+        multiprocessing.set_start_method('spawn', force=True)
+        preprocessor.main()
