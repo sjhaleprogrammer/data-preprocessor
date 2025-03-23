@@ -9,7 +9,6 @@ import os
 import functools
 import multiprocessing
 from multiprocessing import Pool, cpu_count
-import parallel_utils
 import platform
 
 # Set up logging
