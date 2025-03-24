@@ -65,9 +65,9 @@ setuptools
    ```
 
 3. The processed data will be saved to:
-   - `output.parquet` (optimized for further processing)
-   - `output.xlsx` (for easy viewing and sharing)
-
+   - `output.parquet`
+  
+   
 ## Input Format
 
 ### Text Files
