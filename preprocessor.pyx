@@ -570,10 +570,6 @@ def format_for_validation(object merged_df):
                 "conversations": conversation,
                 "source": row['source'],
                 "score": 0,  # Fixed score as per original code
-                "metadata": {
-                    "file": row['file'],
-                    "sequence": row['sequence']
-                }
             })
         
         # Help garbage collection
@@ -765,7 +761,7 @@ def main():
                 # Optional: Preview first record
                 if not df_preview.empty:
                     logger.info("First record sample:")
-                    logger.info(df_preview.iloc[0][0])
+                    print(df_preview)
             except Exception as e:
                 logger.warning(f"Could not preview output: {e}")
         else:

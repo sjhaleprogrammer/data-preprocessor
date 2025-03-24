@@ -7,6 +7,8 @@ pkgs.mkShell {
       beautifulsoup4
       pyarrow
       cython
+      psutil
+      openpyxl
       setuptools
       # Add other Python packages here
     ]))
