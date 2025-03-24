@@ -20,7 +20,7 @@ This tool processes text files from a corpus, extracts content lines that begin 
 
 - Python 3.6+
 - Cython
-- C++ compiler
+- C compiler (recommended gcc)
 
 ## Dependencies
 
