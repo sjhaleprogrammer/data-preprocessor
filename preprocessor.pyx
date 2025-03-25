@@ -9,7 +9,7 @@ from typing import List, Dict, Any, Optional, Tuple
 import os
 import functools
 import multiprocessing
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, freeze_support
 import platform
 import sys
 import gc
@@ -84,6 +84,7 @@ def configure_multiprocessing():
     # Set multiprocessing start method
     if platform_type in ["Windows", "WSL"]:
         # Windows and WSL need specific multiprocessing configuration
+        freeze_support()
         multiprocessing.set_start_method('spawn', force=True)
         logger.info(f"Configured multiprocessing for {platform_type} using 'spawn' method")
     elif platform_type == "MacOS":
