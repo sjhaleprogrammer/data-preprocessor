@@ -637,8 +637,14 @@ def process_data(str input_folder, str sources_file, int num_workers=0):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def export_to_parquet(list data, str output_file):
-    """Export data to a Parquet file."""
+def export_to_parquet(list data, str output_file, bint chunking=False):
+    """Export data to a Parquet file.
+    
+    Args:
+        data: List of processed data records.
+        output_file: Path for the Parquet file.
+        chunking: Toggle to enable or disable chunked export. Default is True.
+    """
     cdef:
         int chunk_size = 10000
         int total_chunks, i, chunk_num
@@ -646,67 +652,70 @@ def export_to_parquet(list data, str output_file):
         list chunk
         object df_chunk, existing_df, combined_df
         str temp_file, excel_file
-    
-    # Process in chunks to avoid memory issues with large datasets
-    total_chunks = (len(data) + chunk_size - 1) // chunk_size
-    
-    if total_chunks > 1:
-        logger.info(f"Exporting data in {total_chunks} chunks...")
-        
-        # Create temporary CSV files for each chunk
-        for i in range(0, len(data), chunk_size):
-            chunk_num = i // chunk_size + 1
-            chunk = data[i:i+chunk_size]
+
+    if chunking:
+        total_chunks = (len(data) + chunk_size - 1) // chunk_size
+
+        if total_chunks > 1:
+            logger.info(f"Exporting data in {total_chunks} chunks...")
             
-            logger.info(f"Processing export chunk {chunk_num}/{total_chunks}")
-            df_chunk = pd.DataFrame(chunk)
-            
-            temp_file = f"temp_export_{chunk_num}.csv"
-            df_chunk.to_csv(temp_file, index=False)
-            temp_files.append(temp_file)
-            
-            # Help garbage collection
-            del df_chunk
-            gc.collect()
-        
-        # Combine all temporary CSV files and export to Parquet
-        logger.info("Combining chunks and exporting to Parquet...")
-        
-        # Read and combine CSVs in chunks
-        with pd.ExcelWriter(output_file.replace('.parquet', '.xlsx'), engine='openpyxl') as writer:
-            for i, temp_file in enumerate(temp_files):
-                df_chunk = pd.read_csv(temp_file)
+            # Create temporary CSV files for each chunk
+            for i in range(0, len(data), chunk_size):
+                chunk_num = i // chunk_size + 1
+                chunk = data[i:i+chunk_size]
                 
-                if i == 0:
-                    df_chunk.to_parquet(output_file, index=False)
-                else:
-                    # Read existing parquet, append new data, write back
-                    existing_df = pd.read_parquet(output_file)
-                    combined_df = pd.concat([existing_df, df_chunk], ignore_index=True)
-                    combined_df.to_parquet(output_file, index=False)
+                logger.info(f"Processing export chunk {chunk_num}/{total_chunks}")
+                df_chunk = pd.DataFrame(chunk)
                 
-                # Also write to Excel (optional, since Parquet is more efficient)
-                df_chunk.to_excel(writer, sheet_name=f"Chunk_{i+1}", index=False)
-                
-                # Delete temp file
-                try:
-                    os.remove(temp_file)
-                except Exception as e:
-                    logger.warning(f"Could not remove temporary file {temp_file}: {e}")
+                temp_file = f"temp_export_{chunk_num}.csv"
+                df_chunk.to_csv(temp_file, index=False)
+                temp_files.append(temp_file)
                 
                 # Help garbage collection
                 del df_chunk
                 gc.collect()
+            
+            # Combine all temporary CSV files and export to Parquet
+            logger.info("Combining chunks and exporting to Parquet...")
+            
+            with pd.ExcelWriter(output_file.replace('.parquet', '.xlsx'), engine='openpyxl') as writer:
+                for i, temp_file in enumerate(temp_files):
+                    df_chunk = pd.read_csv(temp_file)
+                    
+                    if i == 0:
+                        df_chunk.to_parquet(output_file, index=False)
+                    else:
+                        existing_df = pd.read_parquet(output_file)
+                        combined_df = pd.concat([existing_df, df_chunk], ignore_index=True)
+                        combined_df.to_parquet(output_file, index=False)
+                    
+                    df_chunk.to_excel(writer, sheet_name=f"Chunk_{i+1}", index=False)
+                    
+                    try:
+                        os.remove(temp_file)
+                    except Exception as e:
+                        logger.warning(f"Could not remove temporary file {temp_file}: {e}")
+                    
+                    del df_chunk
+                    gc.collect()
+        else:
+            # Small enough to process in one go
+            df_output = pd.DataFrame(data)
+            df_output.to_parquet(output_file, index=False)
+            
+            excel_file = output_file.replace('.parquet', '.xlsx')
+            df_output.to_excel(excel_file, index=False)
+            logger.info(f"Also exported to Excel: {excel_file}")
     else:
-        # Small enough to process in one go
+        # Export all data in one go when chunking is disabled
+        logger.info("Exporting data without chunking...")
         df_output = pd.DataFrame(data)
         df_output.to_parquet(output_file, index=False)
         
-        # Also save as Excel for easier viewing (optional)
         excel_file = output_file.replace('.parquet', '.xlsx')
         df_output.to_excel(excel_file, index=False)
         logger.info(f"Also exported to Excel: {excel_file}")
-    
+
     logger.info(f"Exported {len(data)} records to {output_file}")
 
 def main():
