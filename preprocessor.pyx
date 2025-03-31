@@ -95,7 +95,7 @@ def configure_multiprocessing() -> None:
         # Only set if not already set or if we need to force 'spawn'
         if platform_type in ["Windows", "WSL"]:
             if current_method != 'spawn':
-                multiprocessing.set_start_method('spawn', force=True)
+                multiprocessing.set_start_method('fork', force=True)
                 logger.info(f"Forcing multiprocessing start method to 'spawn' for {platform_type}")
             # freeze_support() is essential for Windows frozen executables
             multiprocessing.freeze_support()
