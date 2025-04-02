@@ -4,7 +4,9 @@
 import re
 import pandas as pd
 import logging
-from bs4 import BeautifulSoup  # Keep import, even if not directly used now, for potential future use in clean_text
+import warnings
+import time
+from bs4 import BeautifulSoup,  MarkupResemblesLocatorWarning  # Keep import, even if not directly used now, for potential future use in clean_text
 from typing import List, Dict, Any, Optional, Tuple
 import os
 import functools
@@ -28,6 +30,8 @@ logging.basicConfig(
     format='%(asctime)s - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
+
+warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
 
 # Define constants
 ENCODINGS: List[str] = ['utf-8', 'latin-1', 'cp1252']
@@ -96,7 +100,7 @@ def configure_multiprocessing() -> None:
         if platform_type in ["Windows", "WSL"]:
             if current_method != 'spawn':
                 multiprocessing.set_start_method('fork', force=True)
-                logger.info(f"Forcing multiprocessing start method to 'spawn' for {platform_type}")
+                logger.info(f"Forcing multiprocessing start method to 'fork' for {platform_type}")
             # freeze_support() is essential for Windows frozen executables
             multiprocessing.freeze_support()
         elif platform_type == "MacOS":
@@ -224,17 +228,35 @@ cpdef str clean_text(str text_obj):
 
     # 3. (Optional) Remove HTML tags if they might be present
     # If HTML is common, enable this. Requires BeautifulSoup.
-    # try:
-    #     # Use 'html.parser' for built-in, no extra dependency
-    #     soup = BeautifulSoup(cleaned_text, 'html.parser')
-    #     cleaned_text = soup.get_text()
-    #     # Re-apply whitespace cleaning after tag removal
-    #     cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
-    # except Exception as e:
-    #     logger.warning(f"BeautifulSoup failed during cleaning (text: '{cleaned_text[:50]}...'): {e}")
-    #     # Fallback: keep the text as is if parsing fails
+    try:
+        # Use 'html.parser' for built-in, no extra dependency
+        soup = BeautifulSoup(cleaned_text, 'html.parser')
+        cleaned_text = soup.get_text()
+        # Re-apply whitespace cleaning after tag removal
+        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+    except Exception as e:
+        logger.warning(f"BeautifulSoup failed during cleaning (text: '{cleaned_text[:50]}...'): {e}")
+        # Fallback: keep the text as is if parsing fails
 
     # Add more cleaning rules here if needed (e.g., removing special characters, normalization)
+    cleaned_text = cleaned_text.replace("--","")
+    cleaned_text = cleaned_text.replace(" ? ","? ")
+    cleaned_text = cleaned_text.replace(" ! ","! ")
+    cleaned_text = cleaned_text.replace(" . ",". ")
+    cleaned_text = cleaned_text.replace(" , ",", ")
+    cleaned_text = cleaned_text.replace(" ( "," (")
+    cleaned_text = cleaned_text.replace(" ) ",") ")
+    cleaned_text = cleaned_text.replace(" ; ","; ")
+    cleaned_text = cleaned_text.replace(" : ",": ")
+    cleaned_text = cleaned_text.replace(" .. . ","... ")
+    cleaned_text = cleaned_text.replace(" 's ","'s ")
+    cleaned_text = cleaned_text.replace("@ @ @ @ @ @ @ @ @ @","<unk>")
+    cleaned_text = cleaned_text.replace("@ @ @ @ @ @","<unk>")
+    cleaned_text = cleaned_text.replace(" \" ", " \"")  # Remove space before opening double quote
+    cleaned_text = cleaned_text.replace("\" ", "\"")    # Remove space after closing double quote
+    cleaned_text = cleaned_text.replace(" ), ", "), ")
+
+    
 
     return cleaned_text
 
@@ -244,20 +266,35 @@ cpdef str clean_text(str text_obj):
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = None) -> Tuple[Optional[List[str]], str]:
-    """Try to read a file with multiple encodings, line by line for memory efficiency."""
+    """
+    Try to read a file with multiple encodings, line by line for memory efficiency.
+    
+    Args:
+        file_path: Path to the file to read
+        encodings: List of encodings to try, in order of preference
+    
+    Returns:
+        Tuple of (list of lines or None if failed, encoding used or empty string)
+    """
     cdef:
         str encoding
         list lines = []
-        object f # File handle object
+        object f  # File handle object
         str line
 
     if encodings is None:
         encodings = ENCODINGS
 
+    # First check if file exists to avoid trying multiple encodings on a missing file
+    if not os.path.exists(file_path):
+        logger.error(f"File not found: {file_path}")
+        return None, ""
+        
     for encoding in encodings:
         try:
+            # Reset lines list for each encoding attempt
+            lines = []
             # Read line by line to avoid loading huge files entirely into memory
-            lines = [] # Reset lines list for each encoding attempt
             with open(file_path, 'r', encoding=encoding) as f:
                 for line in f:
                     lines.append(line)
@@ -266,19 +303,13 @@ def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = Non
             return lines, encoding
         except UnicodeDecodeError:
             logger.debug(f"Failed to decode {file_path} with {encoding}")
-            # If decoding fails partway, 'lines' might contain partial data.
-            # We discard it by continuing to the next encoding.
+            # If decoding fails partway, 'lines' might contain partial data
             continue
-        except FileNotFoundError:
-             logger.error(f"File not found: {file_path}")
-             return None, "" # File doesn't exist
         except IOError as e:
-             logger.error(f"IOError reading file {file_path} with {encoding}: {e}")
-             # Consider if retrying makes sense for some IOErrors
-             return None, "" # Treat as unreadable
+            logger.error(f"IOError reading file {file_path} with {encoding}: {e}")
+            return None, ""
         except Exception as e:
             logger.error(f"Unexpected error reading file {file_path} with {encoding}: {e}")
-            # Don't try other encodings if an unexpected error occurs
             return None, ""
 
     logger.warning(f"Could not decode {file_path} with any specified encoding: {encodings}")
@@ -367,48 +398,42 @@ def process_single_file(file_info_tuple: Tuple[str, str, int, int]) -> Tuple[boo
         str encoding
         list result_lines = []
         cython.int line_num
-        str line
+        str line, line_stripped
         cython.int sequence_counter = 0
 
     file_path = os.path.join(root_dir, filename)
-    # logger.debug(f"Worker {os.getpid()} starting processing: {file_path}") # Debug logging
 
     try:
+        # Read file content
         content, encoding = read_file_with_multiple_encodings(file_path)
 
-        if content is not None:
-            for line_num, line in enumerate(content):
-                # Strip whitespace efficiently
-                line_stripped = line.strip()
-                if line_stripped.startswith('@@'):
-                    sequence_counter += 1
-                    # Store only necessary info, raw line included
-                    result_lines.append({
-                        'line': line_stripped, # Store stripped line
-                        'file_order': file_order,
-                        'line_num': line_num,
-                        'sequence': start_sequence + sequence_counter
-                        # File path added later in the collector to reduce IPC data size
-                    })
-
-            # logger.debug(f"Worker {os.getpid()} finished {file_path}. Found {len(result_lines)} lines.")
-            # Return success, results, and file_path for logging in the main process
-            return True, result_lines, file_path
-        else:
-            logger.warning(f"Could not read or decode file {file_path}, skipping.")
-            return False, [], file_path # Return failure, empty list, and file_path
+        if content is None:
+            return False, [], file_path
+            
+        # Pre-allocate result list capacity if possible (optimization)
+        result_lines = []
+        
+        # Process each line
+        for line_num, line in enumerate(content):
+            line_stripped = line.strip()
+            if line_stripped.startswith('@@'):
+                sequence_counter += 1
+                # Store only necessary data to reduce memory usage
+                result_lines.append({
+                    'line': line_stripped,
+                    'file_order': file_order,
+                    'line_num': line_num,
+                    'sequence': start_sequence + sequence_counter
+                })
+                
+        return True, result_lines, file_path
     except MemoryError:
-         logger.error(f"MemoryError processing file {file_path} in worker {os.getpid()}. Skipping.")
-         # Explicitly trigger garbage collection in the worker before exiting
-         gc.collect()
-         return False, [], file_path
+        logger.error(f"MemoryError processing file {file_path} in worker {os.getpid()}. Skipping.")
+        gc.collect()
+        return False, [], file_path
     except Exception as e:
         logger.error(f"Unexpected error processing file {file_path} in worker {os.getpid()}: {str(e)}")
         return False, [], file_path
-    # finally:
-        # Ensure memory is released (though Python GC should handle 'content')
-        # del content # Explicit deletion
-        # gc.collect() # Force collection in worker (use cautiously, can add overhead)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
@@ -771,15 +796,15 @@ def parse_content_lines_sequential(line_dicts: List[Dict[str, Any]], batch_size:
                 logger.warning(f"Batch {batch_num} resulted in no valid rows.")
                 del batch # Clear slice
                 gc.collect()
-
-        # Combine all temporary files
-        if temp_files:
-            combined_df = _combine_temp_files(temp_files, list(dtypes.keys()), dtypes)
-            return combined_df
-        else:
-            logger.warning("No valid data batches were processed successfully.")
-            return pd.DataFrame()
-
+        
+            # Combine all temporary files
+            if temp_files:
+                combined_df = _combine_temp_files(temp_files, list(dtypes.keys()), dtypes)
+                return combined_df
+            else:
+                logger.warning("No valid data batches were processed successfully.")
+                return pd.DataFrame()
+                
     except Exception as e:
         logger.error(f"Unexpected error during sequential processing loop: {str(e)}")
         return pd.DataFrame() # Return empty on major failure
@@ -787,14 +812,14 @@ def parse_content_lines_sequential(line_dicts: List[Dict[str, Any]], batch_size:
         # Ensure temp dir is cleaned up if possible, even on error
         try:
             if os.path.exists(temp_dir) and not temp_files: # Only remove if empty or fully processed
-                 pass # Keep temp files if _combine failed midway for debugging? Or remove always?
+                pass # Keep temp files if _combine failed midway for debugging? Or remove always?
             # Let's remove always for cleanliness
             if os.path.exists(temp_dir):
                 import shutil
                 shutil.rmtree(temp_dir, ignore_errors=True)
                 logger.info(f"Removed temporary directory: {temp_dir}")
         except Exception as e:
-             logger.warning(f"Could not remove temporary directory {temp_dir}: {e}")
+            logger.warning(f"Could not remove temporary directory {temp_dir}: {e}")
 
 
 @cython.boundscheck(False)
@@ -1430,101 +1455,133 @@ def export_to_parquet_and_excel(data: List[Dict[str, Any]], output_basename: str
 # --- Main Execution Block ---
 
 def main():
-    """Main entry point for the script."""
+    """Main entry point for the script with enhanced error handling and progress tracking."""
     cdef:
         str platform_type, input_folder, sources_txt, output_base
         double available_memory_gb
-        cython.int num_workers = 0 # 0 means auto-calculate
-        list processed_data
-        object df_preview # Pandas DataFrame object
+        cython.int num_workers = 0  # 0 means auto-calculate
+        list processed_data = []
+        object df_preview
+        bint success = False  # Track overall success
+        double start_time = time.time()
 
-    # 1. Configure Environment
-    configure_multiprocessing()
-    platform_type = get_platform_info()
-    available_memory_gb = get_available_memory()
-    logger.info(f"--- System Information ---")
-    logger.info(f"Platform: {platform_type}")
-    logger.info(f"Python Version: {sys.version.split()[0]}")
-    logger.info(f"Pandas Version: {pd.__version__}")
-    logger.info(f"PyArrow Version: {pa.__version__}")
-    logger.info(f"Available Memory: {available_memory_gb:.1f} GB")
-    logger.info(f"CPU Count (Logical): {psutil.cpu_count(logical=True)}")
-    logger.info(f"Multiprocessing Start Method: {multiprocessing.get_start_method(allow_none=True)}")
-    logger.info(f"--------------------------")
+    try:
+        # 1. Configure environment and log system info
+        configure_multiprocessing()
+        platform_type = get_platform_info()
+        available_memory_gb = get_available_memory()
+        
+        logger.info("="*50)
+        logger.info("Starting Data Processing Pipeline")
+        logger.info("="*50)
+        
+        # Enhanced system information logging
+        logger.info("System Information:")
+        logger.info(f"- Platform: {platform_type}")
+        logger.info(f"- Python Version: {sys.version.split()[0]}")
+        logger.info(f"- Pandas Version: {pd.__version__}")
+        logger.info(f"- PyArrow Version: {pa.__version__}")
+        logger.info(f"- Available Memory: {available_memory_gb:.1f} GB")
+        logger.info(f"- CPU Count (Logical): {psutil.cpu_count(logical=True)}")
+        logger.info(f"- Multiprocessing Start Method: {multiprocessing.get_start_method(allow_none=True)}")
+        logger.info("-"*50)
 
+        # 2. Define paths with proper validation
+        input_folder = os.path.abspath(os.getenv('INPUT_FOLDER', 'corpora'))
+        sources_txt = os.path.abspath(os.getenv('SOURCES_FILE', 'sources.txt'))
+        output_base = os.path.abspath(os.getenv('OUTPUT_BASENAME', 'output'))
+        
+        logger.info(f"Input Folder: {input_folder}")
+        logger.info(f"Sources File: {sources_txt}")
+        logger.info(f"Output Base: {output_base}")
+        
+        # Validate input paths
+        if not os.path.isdir(input_folder):
+            logger.error(f"Input folder not found: {input_folder}")
+            return 1
+            
+        if not os.path.isfile(sources_txt):
+            logger.error(f"Sources file not found: {sources_txt}")
+            return 1
+            
+        # 3. Configure worker count
+        num_workers = _configure_worker_count()
+        
+        # 4. Process data with proper progress tracking
+        logger.info("-"*50)
+        logger.info("Starting data processing...")
+        
+        # Monitor memory usage during processing
+        mem_before_processing = get_available_memory()
+        processed_data = process_data(input_folder, sources_txt, num_workers)
+        mem_after_processing = get_available_memory()
+        mem_used = mem_before_processing - mem_after_processing
+        
+        logger.info(f"Processing completed. Memory used: {mem_used:.2f} GB")
+        
+        # 5. Export results if available
+        if processed_data:
+            logger.info(f"Exporting {len(processed_data)} records...")
+            export_to_parquet_and_excel(processed_data, output_base)
+            
+            # Preview output file
+            _preview_output(f"{output_base}.parquet")
+            success = True
+        else:
+            logger.warning("No data to export. Processing may have failed.")
+            
+        # Report overall execution time
+        elapsed_time = time.time() - start_time
+        logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
+        logger.info("="*50)
+        
+        return 0 if success else 1
+        
+    except KeyboardInterrupt:
+        logger.info("Process interrupted by user (KeyboardInterrupt)")
+        return 130  # Standard exit code for SIGINT
+    except MemoryError:
+        logger.critical("Critical memory error occurred. Process may be unstable.")
+        return 137  # Out of memory error code
+    except Exception as e:
+        logger.critical(f"Unhandled exception: {type(e).__name__} - {e}", exc_info=True)
+        return 1
 
-    # 2. Define Paths
-    # Use environment variables or command-line args for flexibility?
-    input_folder = os.getenv('INPUT_FOLDER', 'corpora')
-    sources_txt = os.getenv('SOURCES_FILE', 'sources.txt')
-    output_base = os.getenv('OUTPUT_BASENAME', 'output') # Base name for output files
-
-    logger.info(f"Input Folder: {input_folder}")
-    logger.info(f"Sources File: {sources_txt}")
-    logger.info(f"Output Base Name: {output_base}")
-
-    # Check if input exists
-    if not os.path.isdir(input_folder):
-         logger.error(f"Input folder not found: {input_folder}")
-         sys.exit(1)
-    if not os.path.isfile(sources_txt):
-         logger.error(f"Sources file not found: {sources_txt}")
-         sys.exit(1)
-
-
-    # 3. Determine Number of Workers (can be overridden by env var)
+def _configure_worker_count() -> int:
+    """Configure and validate worker count from environment or system resources."""
     try:
         env_workers = os.getenv('NUM_WORKERS')
         if env_workers:
             num_workers = int(env_workers)
-            logger.info(f"Using NUM_WORKERS from environment variable: {num_workers}")
+            logger.info(f"Using {num_workers} workers from environment variable")
         else:
-            # Auto-calculate based on overall heuristics (will be refined per step)
-            _, num_workers = calculate_processing_parameters(100000, "items") # Use dummy item count for initial calc
-            logger.info(f"Auto-calculated initial number of workers: {num_workers} (will be adjusted per step)")
+            # Auto-calculate workers based on system resources
+            _, num_workers = calculate_processing_parameters(100000, "items")
+            logger.info(f"Auto-configured {num_workers} workers based on system resources")
+            
+        # Validate worker count (at least 1, at most CPU count)
+        num_workers = max(1, min(num_workers, psutil.cpu_count(logical=True)))
+        return num_workers
     except ValueError:
-        logger.warning(f"Invalid NUM_WORKERS environment variable value: {env_workers}. Using auto-calculation.")
+        logger.warning(f"Invalid NUM_WORKERS value: {os.getenv('NUM_WORKERS')}. Using auto-configuration.")
         _, num_workers = calculate_processing_parameters(100000, "items")
+        return num_workers
 
-
-    # 4. Run Processing Pipeline
+def _preview_output(output_file: str) -> None:
+    """Preview the first few rows of output file."""
     try:
-        processed_data = process_data(input_folder, sources_txt, num_workers)
-
-        # 5. Export Results
-        if processed_data:
-            logger.info(f"Processing completed. Exporting {len(processed_data)} records...")
-            export_to_parquet_and_excel(processed_data, output_base, chunk_size=EXPORT_CHUNK_SIZE)
-
-            # 6. Preview Output (Optional and Memory-Safe)
-            logger.info("--- Output Preview (First 5 Rows) ---")
-            try:
-                output_parquet_file = f"{output_base}.parquet"
-                # Read only specific columns and head for preview
-                df_preview = pd.read_parquet(output_parquet_file).head(5)
-                # Pretty print the preview
-                print(df_preview.to_string())
-                logger.info("---------------------------------------")
-
-            except FileNotFoundError:
-                 logger.warning(f"Output file {output_parquet_file} not found for preview.")
-            except Exception as e:
-                logger.warning(f"Could not preview output file: {e}")
-        else:
-            logger.warning("Processing pipeline returned no data to export.")
-
-    except MemoryError:
-        logger.critical("A MemoryError occurred during the main execution. The process might be unstable or results incomplete.")
-        gc.collect() # Try to free some memory before exiting
-        sys.exit(2) # Exit with error code
-    except KeyboardInterrupt:
-         logger.info("Process interrupted by user (KeyboardInterrupt). Exiting.")
-         sys.exit(1)
+        if not os.path.exists(output_file):
+            logger.warning(f"Output file {output_file} not found")
+            return
+            
+        logger.info("Output Preview (First 5 Rows):")
+        df_preview = pd.read_parquet(output_file).head(5)
+        
+        # Format preview for better visibility in logs
+        preview_str = df_preview.to_string()
+        logger.info("\n" + "-"*50 + "\n" + preview_str + "\n" + "-"*50)
     except Exception as e:
-        logger.critical(f"An unexpected critical error occurred in main execution: {e}", exc_info=True) # Log traceback
-        sys.exit(3) # Exit with different error code
-
-    logger.info("Script finished successfully.")
+        logger.warning(f"Could not preview output: {e}")
 
 if __name__ == "__main__":
     # Crucial for multiprocessing, especially on Windows/macOS with 'spawn'
