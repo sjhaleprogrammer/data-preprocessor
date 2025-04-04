@@ -219,9 +219,31 @@ cpdef str clean_text(str text_obj):
         logger.debug(f"clean_text received non-string input: {type(text_obj)}. Converting to string.")
         text_obj = str(text_obj)
 
-    # Basic cleaning:
+    cleaned_text = text_obj
+
+
+    # Add more cleaning rules here if needed (e.g., removing special characters, normalization)
+    cleaned_text = cleaned_text.replace("--","")
+    cleaned_text = cleaned_text.replace(" ?","?")
+    cleaned_text = cleaned_text.replace(" !","!")
+    cleaned_text = cleaned_text.replace(" .",".")
+    cleaned_text = cleaned_text.replace(" ,",",")
+    cleaned_text = cleaned_text.replace("( ","(")
+    cleaned_text = cleaned_text.replace(" )",")")
+    cleaned_text = cleaned_text.replace(" ;",";")
+    cleaned_text = cleaned_text.replace(" :",":")
+    cleaned_text = cleaned_text.replace(" .. .","...")
+    cleaned_text = cleaned_text.replace(" '","'")
+    cleaned_text = re.sub(r'(@\s*)+', "<unk>", cleaned_text)
+    # cleaned_text = cleaned_text.replace(" \"", " \"")  # Remove space before opening double quote
+    # cleaned_text = cleaned_text.replace("\" ", "\" ")    # Remove space after closing double quote
+    cleaned_text = cleaned_text.replace(" n't", "n't")
+    cleaned_text = cleaned_text.replace(" &","&")
+
+    
+        # Basic cleaning:
     # 1. Remove leading/trailing whitespace
-    cleaned_text = text_obj.strip()
+    cleaned_text = cleaned_text.strip()
 
     # 2. Replace multiple spaces with a single space
     cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
@@ -238,27 +260,11 @@ cpdef str clean_text(str text_obj):
         logger.warning(f"BeautifulSoup failed during cleaning (text: '{cleaned_text[:50]}...'): {e}")
         # Fallback: keep the text as is if parsing fails
 
-    # Add more cleaning rules here if needed (e.g., removing special characters, normalization)
-    cleaned_text = cleaned_text.replace("--","")
-    cleaned_text = cleaned_text.replace(" ? ","? ")
-    cleaned_text = cleaned_text.replace(" ! ","! ")
-    cleaned_text = cleaned_text.replace(" . ",". ")
-    cleaned_text = cleaned_text.replace(" , ",", ")
-    cleaned_text = cleaned_text.replace(" ( "," (")
-    cleaned_text = cleaned_text.replace(" ) ",") ")
-    cleaned_text = cleaned_text.replace(" ; ","; ")
-    cleaned_text = cleaned_text.replace(" : ",": ")
-    cleaned_text = cleaned_text.replace(" .. . ","... ")
-    cleaned_text = cleaned_text.replace(" 's ","'s ")
-    cleaned_text = cleaned_text.replace("@ @ @ @ @ @ @ @ @ @","<unk>")
-    cleaned_text = cleaned_text.replace("@ @ @ @ @ @","<unk>")
-    cleaned_text = cleaned_text.replace(" \" ", " \"")  # Remove space before opening double quote
-    cleaned_text = cleaned_text.replace("\" ", "\"")    # Remove space after closing double quote
-    cleaned_text = cleaned_text.replace(" ), ", "), ")
 
-    
+
 
     return cleaned_text
+
 
 
 # --- File Handling and Parsing ---
