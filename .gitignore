@@ -2,3 +2,7 @@ corpora/
 build/
 sources.txt
 Unused/
+preprocessor.c
+output_train.parquet
+output_eval.parquet
+preprocessor.cpython-311-x86_64-linux-gnu.so

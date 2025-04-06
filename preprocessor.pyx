@@ -6,7 +6,7 @@ import pandas as pd
 import logging
 import warnings
 import time
-from bs4 import BeautifulSoup,  MarkupResemblesLocatorWarning  # Keep import, even if not directly used now, for potential future use in clean_text
+from bs4 import BeautifulSoup, MarkupResemblesLocatorWarning
 from typing import List, Dict, Any, Optional, Tuple
 import os
 import functools
@@ -18,1578 +18,975 @@ import psutil
 import math
 import pyarrow as pa
 import pyarrow.parquet as pq
-# Cython imports (ensure these are available)
+import numpy as np
+import shutil
+
+# Cython imports
 cimport cython
-# Cython Standard Library Imports (no Python overhead for these)
-from libc.stdlib cimport malloc, free
-from libc.string cimport strlen, strcpy
+# No C standard library imports needed directly in this version
+# from libc.stdlib cimport malloc, free
+# from libc.string cimport strlen, strcpy
 
 # Set up logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format='%(asctime)s - %(process)d - %(levelname)s - %(message)s',
 )
 logger = logging.getLogger(__name__)
-
 warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
+# Filter the specific ChainedAssignmentError warning if it becomes too noisy during development
+# warnings.filterwarnings('ignore', category=FutureWarning, message=".*ChainedAssignmentError.*")
 
-# Define constants
+# --- Constants ---
 ENCODINGS: List[str] = ['utf-8', 'latin-1', 'cp1252']
-# Memory optimization constants
-MEMORY_SAFETY_FACTOR: float = 0.8  # Use up to 80% of *available* memory estimate
-MIN_MEMORY_PER_WORKER_GB: float = 0.5 # Minimum estimated memory per worker process
-DEFAULT_AVAILABLE_MEMORY_GB: float = 4.0 # Fallback if psutil fails
-# Processing constants
-MIN_BATCH_SIZE: cython.int = 100
-MAX_BATCH_SIZE: cython.int = 5000 # Increased max batch size for potentially faster processing if memory allows
-FILE_PROCESSING_CHUNK_SIZE: cython.int = 50 # Process N files at a time in parallel collection step
-BATCH_PROCESSING_CHUNK_SIZE: cython.int = 50 # Process N batches at a time in parallel parsing step
-EXPORT_CHUNK_SIZE: cython.int = 50000 # Rows per chunk for Parquet/Excel export
+MEMORY_SAFETY_FACTOR: float = 0.8
+MIN_MEMORY_PER_WORKER_GB: float = 0.4
+DEFAULT_AVAILABLE_MEMORY_GB: float = 4.0
+MIN_BATCH_SIZE: cython.int = 200
+MAX_BATCH_SIZE: cython.int = 15000
+FILE_PROCESSING_CHUNK_SIZE: cython.int = 100
+BATCH_PROCESSING_CHUNK_SIZE: cython.int = 100
+EXPORT_CHUNK_SIZE: cython.int = 100000
+TRAIN_SPLIT_RATIO: float = 0.8
+RANDOM_SEED: cython.int = 42
+TEMP_DIR_BASE: str = "temp_parser_batches"
+PREVIEW_ROWS: cython.int = 5 # Number of rows to show in preview
 
-# --- Platform and Resource Detection ---
+# Dtypes
+DTYPES_CONTENT: Dict[str, Any] = {
+    'id': str, 'content': str, 'file': str,
+    'file_order': np.uint32, 'line_num': np.uint32, 'sequence': np.int64
+}
+DTYPES_SOURCES: Dict[str, Any] = {
+    'id': str, 'year': str, 'type': 'category',
+    'pages': str, 'source': str, 'title': str
+}
+DTYPES_MERGED: Dict[str, Any] = {**DTYPES_CONTENT, **DTYPES_SOURCES}
+
+# Precompiled Regex
+_RE_MULTI_SPACE = re.compile(r'\s+')
+_RE_UNK = re.compile(r'(@\s*)+')
+# Refined cleanup patterns
+_RE_CLEANUP = {
+    # General spacing before punctuation
+    re.compile(r" \?"): "?",
+    re.compile(r" !"): "!",
+    re.compile(r" \."): ".", # Note: Escaped dot
+    re.compile(r" ,"): ",",
+    re.compile(r" ;"): ";",
+    re.compile(r" :"): ":",
+    # Specific cases
+    re.compile(r" --"): "",
+    re.compile(r" \.\. \."): "...", # Or rely on multi-space cleanup? Specific is safer.
+    re.compile(r" n't"): "n't",
+    re.compile(r" &"): "&",
+     # --- Rules for spaces INSIDE quotes and parentheses ---
+    re.compile(r'\(\s+'): '(', # Remove space(s) after (
+    re.compile(r'\s+\)'): ')', # Remove space(s) before )
+    re.compile(r'"\s+'): '"', # Remove space(s) after "
+    re.compile(r"\s+\""): '"', # Remove space(s) before "
+    re.compile(r"'\s+"): "'", # Remove space(s) after '
+    re.compile(r"\s+'"): "'", # Remove space(s) before '
+    # Note: The rule re.compile(r" '"): "'" might be redundant now but harmless
+} 
+
+
+# --- Platform & Resource Utils ---
 
 @cython.cfunc
 @cython.inline
 def get_platform_info() -> str:
-    """Detect the platform and return information about it. (Cythonized for potential minor speedup if called often)"""
-    cdef str system_str
     try:
-        system_str = platform.system()
-        if system_str == "Linux":
-            # Check if running in WSL
-            uname_release: str = platform.uname().release.lower()
-            if "microsoft" in uname_release or "wsl" in uname_release:
-                return "WSL"
-            return "Linux"
-        elif system_str == "Darwin":
-            return "MacOS"
-        elif system_str == "Windows":
-            return "Windows"
-    except Exception as e:
-        logger.warning(f"Could not detect platform accurately: {e}")
-    return "Unknown"
+        s = platform.system()
+        if s == "Linux": return "WSL" if "microsoft" in platform.uname().release.lower() else "Linux"
+        return s
+    except Exception: return "Unknown"
 
 @cython.cfunc
 def get_available_memory() -> cython.double:
-    """Get available system memory in GB."""
-    cdef:
-        double available_gb, total_gb
-        object mem_info # Use object for psutil result
-
-    try:
-        mem_info = psutil.virtual_memory()
-        available_gb = mem_info.available / (1024.0 ** 3)
-        total_gb = mem_info.total / (1024.0 ** 3)
-        # Log less frequently or only if significantly changed? For now, keep it.
-        # logger.debug(f"System memory: {total_gb:.1f} GB total, {available_gb:.1f} GB available")
-        return max(0.1, available_gb) # Ensure returns at least a small positive value
-    except Exception as e:
-        logger.warning(f"Could not determine available memory via psutil: {e}. Using default: {DEFAULT_AVAILABLE_MEMORY_GB} GB")
-        return DEFAULT_AVAILABLE_MEMORY_GB
+    try: return max(0.1, psutil.virtual_memory().available / (1024.0 ** 3))
+    except Exception: return DEFAULT_AVAILABLE_MEMORY_GB
 
 def configure_multiprocessing() -> None:
-    """Configure multiprocessing based on the platform and Python version."""
-    cdef str platform_type = get_platform_info()
-
-    # Set multiprocessing start method
-    # 'spawn' is generally safer cross-platform, especially with complex imports or global state,
-    # though it has higher overhead than 'fork'. 'fork' is Linux/macOS default but can be problematic.
+    platform_type: str = get_platform_info()
+    desired_method: str = 'fork' if platform_type in ["Windows", "WSL"] or (platform_type == "MacOS" and sys.version_info >= (3, 8)) else 'fork'
     try:
         current_method = multiprocessing.get_start_method(allow_none=True)
-        # Only set if not already set or if we need to force 'spawn'
-        if platform_type in ["Windows", "WSL"]:
-            if current_method != 'spawn':
-                multiprocessing.set_start_method('fork', force=True)
-                logger.info(f"Forcing multiprocessing start method to 'fork' for {platform_type}")
-            # freeze_support() is essential for Windows frozen executables
-            multiprocessing.freeze_support()
-        elif platform_type == "MacOS":
-            # Newer Python versions on macOS default to 'spawn', which is safer.
-            # Let's prefer 'spawn' unless explicitly on an old Python version.
-            if sys.version_info >= (3, 8):
-                 if current_method != 'spawn':
-                    multiprocessing.set_start_method('spawn', force=True)
-                    logger.info("Forcing multiprocessing start method to 'spawn' for MacOS (Python >= 3.8)")
-            else: # Older Python on macOS might default to 'fork'
-                 if current_method != 'fork':
-                    multiprocessing.set_start_method('fork', force=True)
-                    logger.info("Forcing multiprocessing start method to 'fork' for MacOS (Python < 3.8)")
-        else: # Linux and others
-             if current_method != 'fork':
-                multiprocessing.set_start_method('fork', force=True)
-                logger.info(f"Forcing multiprocessing start method to 'fork' for {platform_type}")
+        if current_method != desired_method:
+             multiprocessing.set_start_method(desired_method, force=True)
+             logger.info(f"Set multiprocessing start method to '{desired_method}'")
+        if platform_type == "Windows": multiprocessing.freeze_support()
     except Exception as e:
-        logger.error(f"Failed to configure multiprocessing start method: {e}. Using default.")
-        if platform_type == "Windows":
-             # Ensure freeze_support is called anyway for Windows bundling
-             multiprocessing.freeze_support()
+        logger.error(f"Failed config multiprocessing '{desired_method}': {e}. Using default: {multiprocessing.get_start_method(allow_none=True)}")
+        if platform_type == "Windows": multiprocessing.freeze_support()
 
 @cython.cdivision(True)
 def calculate_processing_parameters(total_items: cython.int, item_type: str = "lines") -> Tuple[cython.int, cython.int]:
-    """
-    Calculate optimal batch size and worker count based on system resources and item count.
+    available_memory_gb: float = get_available_memory()
+    logical_cpu_count: int = psutil.cpu_count(logical=True) or 2
+    est_mem_kb = 15 if item_type == "lines" else 512
+    max_mem_batch_gb = available_memory_gb * 0.10
+    calc_batch = <cython.int>((max_mem_batch_gb * 1024**2) / est_mem_kb) if est_mem_kb > 0 else MAX_BATCH_SIZE
+    batch_size = max(MIN_BATCH_SIZE, min(calc_batch, MAX_BATCH_SIZE))
 
-    Args:
-        total_items: The total number of items (e.g., lines, files) to process.
-        item_type: A string descriptor for logging (e.g., "lines", "files").
+    mem_workers = max(1, <cython.int>((available_memory_gb * MEMORY_SAFETY_FACTOR) / MIN_MEMORY_PER_WORKER_GB))
+    cpu_workers = max(1, logical_cpu_count - 1)
+    workers = max(1, min(mem_workers, cpu_workers))
+    workers = max(1, min(workers, (total_items + batch_size - 1) // batch_size, total_items))
 
-    Returns:
-        A tuple containing (optimal_batch_size, optimal_workers).
-    """
-    cdef:
-        double available_memory_gb = get_available_memory()
-        str platform_type = get_platform_info()
-        # Estimate memory per item (adjust based on expected item size)
-        # Let's use a slightly higher estimate for safety margin
-        cython.int estimated_memory_per_item_kb = 15 if item_type == "lines" else 1024 # 15KB/line, 1MB/file (rough estimates)
-        double total_memory_needed_gb
-        double max_memory_per_batch_gb
-        cython.int optimal_batch_size, physical_cpu_count, logical_cpu_count
-        cython.int base_workers, memory_based_workers, optimal_workers
-
-    logger.info(f"Calculating parameters based on {available_memory_gb:.1f} GB RAM and {total_items} {item_type}")
-
-    # Calculate memory requirements (rough estimate)
-    total_memory_needed_gb = (total_items * estimated_memory_per_item_kb) / (1024.0 * 1024.0)
-    logger.info(f"Estimated total memory needed for {item_type}: {total_memory_needed_gb:.2f} GB (very approximate)")
-
-    # Determine optimal batch size based on available memory
-    # Use a fraction of *available* memory per batch, leaving room for OS and other processes.
-    # Let's target ~10-15% of available memory per batch.
-    max_memory_per_batch_gb = available_memory_gb * 0.15
-
-    # Calculate optimal batch size
-    optimal_batch_size = MIN_BATCH_SIZE # Default to minimum
-    if estimated_memory_per_item_kb > 0:
-        calculated_batch_size = <cython.int>((max_memory_per_batch_gb * 1024.0 * 1024.0) / estimated_memory_per_item_kb)
-        # Clamp between MIN_BATCH_SIZE and MAX_BATCH_SIZE
-        optimal_batch_size = max(MIN_BATCH_SIZE, min(calculated_batch_size, MAX_BATCH_SIZE))
-
-    # Determine optimal worker count
-    try:
-        physical_cpu_count = psutil.cpu_count(logical=False) or 1
-        logical_cpu_count = psutil.cpu_count(logical=True) or 2
-    except Exception:
-        logger.warning("Could not get CPU counts via psutil. Using defaults (1 physical, 2 logical).")
-        physical_cpu_count = 1
-        logical_cpu_count = 2
-
-    # Base worker count heuristic based on platform (more conservative)
-    if platform_type == "WSL":
-        base_workers = max(1, min(physical_cpu_count, logical_cpu_count // 2, 4)) # WSL often shares resources heavily
-    elif platform_type == "Windows":
-        base_workers = max(1, min(logical_cpu_count - 1, physical_cpu_count, 6)) # Windows 'spawn' overhead
-    else: # Linux, MacOS
-        base_workers = max(1, min(logical_cpu_count - 1, physical_cpu_count * 2)) # Can often utilize hyperthreading better
-
-    # Adjust worker count based on available memory per worker
-    memory_based_workers = max(1, <cython.int>((available_memory_gb * MEMORY_SAFETY_FACTOR) / MIN_MEMORY_PER_WORKER_GB))
-
-    # Final worker count: minimum of CPU-based and memory-based, ensuring at least 1
-    optimal_workers = max(1, min(base_workers, memory_based_workers))
-
-    # Further reduce workers if total items are very few compared to workers
-    optimal_workers = max(1, min(optimal_workers, (total_items + optimal_batch_size - 1) // optimal_batch_size )) # No more workers than batches
-    optimal_workers = max(1, min(optimal_workers, total_items)) # No more workers than items
-
-    logger.info(f"Optimal processing parameters: batch_size={optimal_batch_size}, workers={optimal_workers}")
-    return optimal_batch_size, optimal_workers
+    logger.info(f"Params ({available_memory_gb:.1f}GB RAM, {logical_cpu_count} CPU): batch={batch_size}, workers={workers}")
+    return batch_size, workers
 
 # --- Text Cleaning ---
 
-# Public function that users will call
-@cython.boundscheck(False)
-@cython.wraparound(False)
-# @functools.lru_cache(maxsize=1024) # Caching might be useful if the same text appears often, but adds overhead. Consider if needed.
-cpdef str clean_text(str text_obj):
-    """
-    Clean text by applying various text cleaning operations.
-    This version focuses on basic cleaning. Add more rules as needed.
+@functools.lru_cache(maxsize=16384)
+@cython.cfunc
+@cython.inline
+def clean_text_cython(text_obj: str) -> str:
+    # Use 'object' for BeautifulSoup result as it's a Python object
+    cdef object soup, pattern, replacement
+    # Use 'str' for known string types
+    cdef str cleaned_text, new_text, text_before_bs
 
-    Args:
-        text_obj: The text to clean
+    if not isinstance(text_obj, str): text_obj = str(text_obj)
 
-    Returns:
-        Cleaned text
-    """
-    cdef str cleaned_text
+    # 1. Initial strip and @ mentions
+    cleaned_text = text_obj.strip()
+    cleaned_text = _RE_UNK.sub('<unk>', cleaned_text)
+    text_before_bs = cleaned_text # Store before potential BS modification
 
-    if not isinstance(text_obj, str):
-        # Handle potential non-string input gracefully
-        logger.debug(f"clean_text received non-string input: {type(text_obj)}. Converting to string.")
-        text_obj = str(text_obj)
-
-    cleaned_text = text_obj
-
-
-    # Add more cleaning rules here if needed (e.g., removing special characters, normalization)
-    cleaned_text = cleaned_text.replace("--","")
-    cleaned_text = cleaned_text.replace(" ?","?")
-    cleaned_text = cleaned_text.replace(" !","!")
-    cleaned_text = cleaned_text.replace(" .",".")
-    cleaned_text = cleaned_text.replace(" ,",",")
-    cleaned_text = cleaned_text.replace("( ","(")
-    cleaned_text = cleaned_text.replace(" )",")")
-    cleaned_text = cleaned_text.replace(" ;",";")
-    cleaned_text = cleaned_text.replace(" :",":")
-    cleaned_text = cleaned_text.replace(" .. .","...")
-    cleaned_text = cleaned_text.replace(" '","'")
-    cleaned_text = re.sub(r'(@\s*)+', "<unk>", cleaned_text)
-    # cleaned_text = cleaned_text.replace(" \"", " \"")  # Remove space before opening double quote
-    # cleaned_text = cleaned_text.replace("\" ", "\" ")    # Remove space after closing double quote
-    cleaned_text = cleaned_text.replace(" n't", "n't")
-    cleaned_text = cleaned_text.replace(" &","&")
-
-    
-        # Basic cleaning:
-    # 1. Remove leading/trailing whitespace
-    cleaned_text = cleaned_text.strip()
-
-    # 2. Replace multiple spaces with a single space
-    cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
-
-    # 3. (Optional) Remove HTML tags if they might be present
-    # If HTML is common, enable this. Requires BeautifulSoup.
+    # 2. BeautifulSoup for HTML stripping
     try:
-        # Use 'html.parser' for built-in, no extra dependency
         soup = BeautifulSoup(cleaned_text, 'html.parser')
-        cleaned_text = soup.get_text()
-        # Re-apply whitespace cleaning after tag removal
-        cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+        new_text = soup.get_text()
+        # Only update if BS actually changed the text AND the result is not empty
+        if new_text != text_before_bs and new_text:
+            cleaned_text = new_text
+            # *Crucial*: Re-run basic whitespace cleanup after HTML stripping
+            cleaned_text = _RE_MULTI_SPACE.sub(' ', cleaned_text).strip()
     except Exception as e:
-        logger.warning(f"BeautifulSoup failed during cleaning (text: '{cleaned_text[:50]}...'): {e}")
-        # Fallback: keep the text as is if parsing fails
+        # Log warning only if input likely contained HTML tags
+        if '<' in text_before_bs and '>' in text_before_bs:
+             logger.warning(f"BSoup cleaning failed (text: '{text_before_bs[:50]}...'): {e}")
 
+    # 3. Apply specific pattern replacements from _RE_CLEANUP
+    # This now includes the quote and parenthesis spacing rules
+    for pattern, replacement in _RE_CLEANUP.items():
+         cleaned_text = pattern.sub(replacement, cleaned_text)
 
+    # 4. Final pass to catch any multi-spaces possibly introduced by replacements
+    cleaned_text = _RE_MULTI_SPACE.sub(' ', cleaned_text)
 
+    # 5. Final strip
+    return cleaned_text.strip()
 
-    return cleaned_text
-
-
-
-# --- File Handling and Parsing ---
+# --- File Handling & Parsing ---
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def read_file_with_multiple_encodings(file_path: str, encodings: List[str] = None) -> Tuple[Optional[List[str]], str]:
-    """
-    Try to read a file with multiple encodings, line by line for memory efficiency.
-    
-    Args:
-        file_path: Path to the file to read
-        encodings: List of encodings to try, in order of preference
-    
-    Returns:
-        Tuple of (list of lines or None if failed, encoding used or empty string)
-    """
-    cdef:
-        str encoding
-        list lines = []
-        object f  # File handle object
-        str line
-
-    if encodings is None:
-        encodings = ENCODINGS
-
-    # First check if file exists to avoid trying multiple encodings on a missing file
-    if not os.path.exists(file_path):
-        logger.error(f"File not found: {file_path}")
-        return None, ""
-        
-    for encoding in encodings:
+def read_file_lines(file_path: str) -> Tuple[Optional[List[str]], str]:
+    if not os.path.exists(file_path): return None, ""
+    cdef str encoding, used_encoding = ""
+    cdef list lines = None
+    cdef object f # File handle is a Python object
+    for encoding in ENCODINGS:
         try:
-            # Reset lines list for each encoding attempt
-            lines = []
-            # Read line by line to avoid loading huge files entirely into memory
             with open(file_path, 'r', encoding=encoding) as f:
-                for line in f:
-                    lines.append(line)
-            # If we successfully read the whole file
-            logger.debug(f"Successfully read {file_path} with encoding {encoding}")
-            return lines, encoding
-        except UnicodeDecodeError:
-            logger.debug(f"Failed to decode {file_path} with {encoding}")
-            # If decoding fails partway, 'lines' might contain partial data
-            continue
-        except IOError as e:
-            logger.error(f"IOError reading file {file_path} with {encoding}: {e}")
-            return None, ""
+                lines = f.readlines()
+            used_encoding = encoding
+            break
+        except (UnicodeDecodeError, TypeError): continue
         except Exception as e:
-            logger.error(f"Unexpected error reading file {file_path} with {encoding}: {e}")
+            logger.error(f"Error reading {file_path} with {encoding}: {e}")
             return None, ""
-
-    logger.warning(f"Could not decode {file_path} with any specified encoding: {encodings}")
-    return None, ""
+    if lines is None:
+        logger.warning(f"Could not decode {file_path} with {ENCODINGS}")
+    return lines, used_encoding
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def parse_sources_file(sources_file: str) -> pd.DataFrame:
-    """Parse the sources file into a DataFrame."""
-    cdef:
-        list lines = None
-        str line, encoding
-        list parts
-        dict record
-        list sources_data = []
-        object df # Use object for Pandas DataFrame type
+    # Declare df as Python object within cdef if needed, otherwise rely on Python typing
+    cdef list lines = [] # Initialize
+    cdef list sources_data = []
+    cdef str encoding = "" # Initialize
+    cdef str line = "" # Initialize
+    cdef list parts = [] # Initialize
+    cdef object df # Use object for DataFrame
 
-    lines, encoding = read_file_with_multiple_encodings(sources_file)
-    if lines is None: # Changed check from 'not lines' to 'is None' for clarity
-        logger.error(f"Could not read or decode sources file: {sources_file}")
-        return pd.DataFrame() # Return empty DataFrame
+    lines, encoding = read_file_lines(sources_file)
+    # Return type hint handles the expected output type for Python
+    if lines is None: return pd.DataFrame(columns=DTYPES_SOURCES.keys()).astype(DTYPES_SOURCES)
 
-    logger.info(f"Parsing sources file {sources_file} (detected encoding: {encoding})")
+    logger.info(f"Parsing sources file {sources_file} (encoding: {encoding})")
     for line in lines:
         line = line.strip()
-        if not line: # Skip empty lines
-            continue
-        parts = line.split(maxsplit=5) # Split efficiently, max 5 splits needed
+        if not line: continue
+        parts = line.split(maxsplit=5)
         if len(parts) == 6:
-            # Basic validation (e.g., check if year is numeric) can be added here
-            record = {
-                'id': parts[0],
-                'year': parts[1],
-                'type': parts[2],
-                'pages': parts[3],
-                'source': parts[4],
-                'title': parts[5] # The rest is title
-            }
-            sources_data.append(record)
+            sources_data.append({'id': parts[0], 'year': parts[1], 'type': parts[2],
+                                 'pages': parts[3], 'source': parts[4], 'title': parts[5]})
         else:
-            logger.warning(f"Skipping malformed line in sources file: '{line[:100]}...' (found {len(parts)} parts)")
+            logger.warning(f"Skipping malformed line in sources: '{line[:80]}...'")
 
-    if not sources_data:
-        logger.warning("No valid data found in sources file")
-        return pd.DataFrame()
+    if not sources_data: return pd.DataFrame(columns=DTYPES_SOURCES.keys()).astype(DTYPES_SOURCES)
 
     try:
-        df = pd.DataFrame(sources_data)
-        # Optimize DataFrame memory usage
-        df.loc['id'] = df['id'].astype(str) # Ensure 'id' is string for merging
-        # Consider converting 'year', 'pages' to numeric if appropriate
-        # df['year'] = pd.to_numeric(df['year'], errors='coerce')
-        # df['pages'] = pd.to_numeric(df['pages'], errors='coerce')
-        # Convert low-cardinality columns to 'category'
-        df.loc['type'] = df['type'].astype('category')
-        logger.info(f"Loaded {len(df)} source records into DataFrame")
+        # df is assigned a Python object here
+        df = pd.DataFrame(sources_data).astype(DTYPES_SOURCES)
+        logger.info(f"Loaded {len(df)} sources. RAM: {df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
         return df
     except Exception as e:
-        logger.error(f"Error creating DataFrame from sources data: {e}")
-        return pd.DataFrame()
-
+        logger.error(f"Error creating sources DataFrame: {e}")
+        return pd.DataFrame(columns=DTYPES_SOURCES.keys()).astype(DTYPES_SOURCES)
 
 # --- Parallel Content Collection ---
 
-# Worker function for process_file
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def process_single_file(file_info_tuple: Tuple[str, str, int, int]) -> Tuple[bool, List[Dict[str, Any]], str]:
-    """
-    Processes a single file: reads, finds '@@' lines, assigns sequence numbers.
-
-    Args:
-        file_info_tuple: Tuple containing (root_dir, filename, file_order, start_sequence).
-
-    Returns:
-        Tuple: (success_flag, list_of_line_dicts, file_path)
-               line_dict keys: 'line', 'file', 'file_order', 'line_num', 'sequence'
-    """
     cdef:
         str root_dir = file_info_tuple[0]
         str filename = file_info_tuple[1]
-        cython.int file_order = file_info_tuple[2]
-        cython.int start_sequence = file_info_tuple[3]
-        str file_path
-        list content = None
-        str encoding
+        cython.uint file_order = <cython.uint>file_info_tuple[2]
+        cython.longlong sequence_base = <cython.longlong>file_info_tuple[3]
+        str file_path = os.path.join(root_dir, filename)
+        list content = None # Initialized
         list result_lines = []
-        cython.int line_num
-        str line, line_stripped
+        str encoding = ""
+        str line = ""
+        str line_stripped = ""
+        cython.uint line_num = 0
         cython.int sequence_counter = 0
 
-    file_path = os.path.join(root_dir, filename)
-
     try:
-        # Read file content
-        content, encoding = read_file_with_multiple_encodings(file_path)
+        content, encoding = read_file_lines(file_path)
+        if content is None: return False, [], file_path
 
-        if content is None:
-            return False, [], file_path
-            
-        # Pre-allocate result list capacity if possible (optimization)
-        result_lines = []
-        
-        # Process each line
         for line_num, line in enumerate(content):
             line_stripped = line.strip()
             if line_stripped.startswith('@@'):
                 sequence_counter += 1
-                # Store only necessary data to reduce memory usage
                 result_lines.append({
                     'line': line_stripped,
                     'file_order': file_order,
-                    'line_num': line_num,
-                    'sequence': start_sequence + sequence_counter
+                    'line_num': <cython.uint>line_num,
+                    'sequence': sequence_base + sequence_counter
                 })
-                
         return True, result_lines, file_path
-    except MemoryError:
-        logger.error(f"MemoryError processing file {file_path} in worker {os.getpid()}. Skipping.")
-        gc.collect()
-        return False, [], file_path
     except Exception as e:
-        logger.error(f"Unexpected error processing file {file_path} in worker {os.getpid()}: {str(e)}")
+        logger.error(f"Error processing {file_path} (worker {os.getpid()}): {e}")
         return False, [], file_path
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def collect_content_lines_parallel(input_folder: str, num_workers: cython.int = 0) -> List[Dict[str, Any]]:
-    """
-    Walk through directories, collect '@@' lines using parallel processing with chunking.
-
-    Args:
-        input_folder: Path to the root directory containing .txt files.
-        num_workers: Number of worker processes. If 0, calculated automatically.
-
-    Returns:
-        A list of dictionaries, each representing a found line and its metadata.
-        Sorted by 'sequence'.
-    """
+def collect_content_lines_parallel(input_folder: str, num_workers: cython.int) -> List[Dict[str, Any]]:
     cdef:
         list file_infos = []
-        cython.int file_order = 0
-        cython.int total_files = 0
-        str root, filename
-        list dirs, files, txt_files # For os.walk results
+        cython.int file_order = 0, total_files = 0
+        str root = "" # Initialize
+        str filename = "" # Initialize
+        list txt_files = []
         list all_lines = []
-        cython.int processed_files = 0
-        cython.int skipped_files = 0
-        cython.int actual_workers
-        cython.int chunk_size_files
-        cython.int chunk_idx, num_file_chunks
-        list file_chunk
-        object pool # multiprocessing.Pool object
-        list results
-        bint success
-        list lines
-        str file_path_processed # Renamed from file_path to avoid clash
-        dict line_dict
+        cython.int processed_files = 0, skipped_files = 0
+        cython.int actual_workers = 0 # Initialize
+        cython.int chunk_size_files = 0 # Initialize
+        cython.int num_file_chunks = 0 # Initialize
+        cython.int chunk_idx = 0 # Initialize
+        cython.int start_idx = 0 # Initialize
+        list file_chunk = []
+        object pool # Use object for multiprocessing.Pool
+        bint success = False # Initialize
+        list lines = []
+        str file_path_processed = ""
+        cython.longlong SEQUENCE_GAP = 2_000_000
+        object results_iterator # Use object for iterator type
 
-
-    logger.info(f"Starting parallel collection from folder: {input_folder}")
-
-    # 1. Gather all file information first
-    logger.info("Scanning directories for .txt files...")
-    for root, dirs, files in os.walk(input_folder):
-        # Sort files within directory for deterministic order (optional but good practice)
+    logger.info(f"Collecting content from: {input_folder}")
+    for root, _, files in os.walk(input_folder):
         txt_files = sorted([f for f in files if f.lower().endswith('.txt')])
-        if txt_files:
-            total_files += len(txt_files)
-            for filename in txt_files:
-                # Tuple: (root_dir, filename, file_order, starting_sequence_for_this_file)
-                # Assign a large sequence block per file to ensure sorting works
-                file_infos.append((root, filename, file_order, file_order * 1000000)) # Increased sequence gap
-                file_order += 1
+        for filename in txt_files:
+            file_infos.append((root, filename, file_order, file_order * SEQUENCE_GAP))
+            file_order += 1
+    total_files = len(file_infos)
 
-    if total_files == 0:
-        logger.warning(f"No .txt files found in {input_folder}. Returning empty list.")
-        return []
+    if total_files == 0: logger.warning("No .txt files found."); return []
+    logger.info(f"Found {total_files} .txt files.")
 
-    logger.info(f"Found {total_files} .txt files to process.")
-
-    # 2. Determine processing parameters (workers, file chunk size for pool submission)
-    # Calculate based on number of *files* here
     _, actual_workers = calculate_processing_parameters(total_files, "files")
-    if num_workers > 0: # Allow user override
-        actual_workers = max(1, min(num_workers, actual_workers)) # Respect user choice but cap by calculation
-    logger.info(f"Using {actual_workers} worker processes for file collection.")
-
-    # Determine chunk size for submitting files to the pool
+    if num_workers > 0: actual_workers = max(1, min(num_workers, actual_workers))
     chunk_size_files = max(1, min(FILE_PROCESSING_CHUNK_SIZE, (total_files + actual_workers - 1) // actual_workers))
     num_file_chunks = (len(file_infos) + chunk_size_files - 1) // chunk_size_files
-    logger.info(f"Processing files in {num_file_chunks} chunks of up to {chunk_size_files} files each.")
+    logger.info(f"Using {actual_workers} workers, {num_file_chunks} file chunks...")
 
-
-    # 3. Process file chunks in parallel
     for chunk_idx in range(num_file_chunks):
         start_idx = chunk_idx * chunk_size_files
-        end_idx = min(start_idx + chunk_size_files, total_files)
-        file_chunk = file_infos[start_idx:end_idx]
-
-        if not file_chunk: continue # Should not happen, but safety check
-
-        logger.info(f"Processing file chunk {chunk_idx + 1}/{num_file_chunks} ({len(file_chunk)} files) using {actual_workers} workers...")
-
+        file_chunk = file_infos[start_idx : min(start_idx + chunk_size_files, total_files)]
+        if not file_chunk: continue
+        logger.info(f"Processing file chunk {chunk_idx + 1}/{num_file_chunks}...")
         try:
-            # Create pool inside the loop to potentially help with memory leaks in long runs
-            # Use maxtasksperchild to automatically restart workers after N tasks
-            with multiprocessing.Pool(processes=actual_workers, maxtasksperchild=10) as pool:
-                 # Use map_async for potentially better overlap, or imap_unordered for memory efficiency if order doesn't matter until final sort
-                 # Let's stick with map for simplicity now, but imap_unordered is a good candidate if memory is tight
-                results = pool.map(process_single_file, file_chunk, chunksize=1) # Small chunksize for map
-
-            # Process results from the chunk
-            for success, lines, file_path_processed in results:
-                if success:
-                    # Add file path to each line dictionary now
-                    for line_dict in lines:
-                        line_dict['file'] = file_path_processed
-                    all_lines.extend(lines)
-                    processed_files += 1
-                else:
-                    skipped_files += 1
-                    # Logging for skipped file already happened in worker or process_single_file
-
-            logger.info(f"Finished file chunk {chunk_idx + 1}. Processed: {processed_files}, Skipped: {skipped_files}, Lines collected so far: {len(all_lines)}")
-
-        except (MemoryError, OSError, Exception) as e: # Catch broader errors during pool operation
-            logger.error(f"Error during parallel processing of file chunk {chunk_idx + 1}: {type(e).__name__} - {e}")
-            logger.warning("Attempting to continue with the next chunk (if any). Some files may be skipped.")
-            # Count files in the failed chunk as skipped
+            # Use 'object' type hint for pool for robustness
+            with multiprocessing.Pool(processes=actual_workers, maxtasksperchild=25) as pool:
+                results_iterator = pool.imap_unordered(process_single_file, file_chunk, chunksize=1)
+                # Explicitly type loop variables if needed, though Cython often infers correctly
+                for success, lines, file_path_processed in results_iterator:
+                    if success:
+                        # line_dict is implicitly created in the loop
+                        for line_dict in lines: line_dict['file'] = file_path_processed
+                        all_lines.extend(lines)
+                        processed_files += 1
+                    else: skipped_files += 1
+        except Exception as e:
+            logger.error(f"Error processing file chunk {chunk_idx + 1}: {e}")
             skipped_files += len(file_chunk)
-            # Fallback: Could implement sequential processing for the failed chunk here if needed
-            # for file_info in file_chunk:
-            #     success, lines, file_path_processed = process_single_file(file_info)
-            #     # ... (process results as above) ...
-
         finally:
-            # Explicitly trigger garbage collection after each chunk processing
-            # Helps release memory held by results list and potentially workers
-            logger.debug("Triggering garbage collection after file chunk processing.")
-            # Clear intermediate results list
-            del results
-            gc.collect()
+            del file_chunk; gc.collect()
 
-
-    # 4. Final Sort and Summary
-    if not all_lines:
-        logger.warning("No '@@' lines collected from any file.")
-        return []
-
-    logger.info(f"Sorting {len(all_lines)} collected lines by sequence...")
-    try:
-        # Sort in-place to save memory
-        all_lines.sort(key=lambda x: x['sequence'])
-        logger.info("Sorting complete.")
-    except MemoryError:
-        logger.error("MemoryError during final sorting of collected lines. Data might be incomplete or unsorted.")
-        # Cannot proceed reliably if sorting fails due to memory.
-        # Could attempt to save unsorted data here if needed.
-        return [] # Return empty or handle error appropriately
-
-    logger.info(f"--- File Collection Summary ---")
-    logger.info(f"- Total .txt files found: {total_files}")
-    logger.info(f"- Files processed successfully: {processed_files}")
-    logger.info(f"- Files skipped (read error, decode error, processing error): {skipped_files}")
-    logger.info(f"- Total '@@' lines collected: {len(all_lines)}")
-    logger.info(f"-------------------------------")
-
+    if not all_lines: logger.warning("No '@@' lines collected."); return []
+    logger.info(f"Collected {len(all_lines)} lines (Processed: {processed_files}, Skipped: {skipped_files}). Sorting...")
+    all_lines.sort(key=lambda x: x['sequence'])
+    logger.info("Sorting complete.")
     return all_lines
-
 
 # --- Content Parsing (from Collected Lines) ---
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def process_content_batch(batch_data: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Processes a batch of line dictionaries: extracts ID/content, cleans content.
-
-    Args:
-        batch_data: A list of line dictionaries from the collection step.
-
-    Returns:
-        A list of dictionaries ready for DataFrame creation.
-        Keys: 'id', 'content', 'file', 'file_order', 'line_num', 'sequence'
-    """
-    cdef:
-        list rows = []
-        dict line_dict
-        str line, content_raw, content_cleaned
-        list parts
-        str line_id # Use specific name
-
-    # logger.debug(f"Worker {os.getpid()} processing batch of {len(batch_data)} lines.") # Debug logging
+    cdef list rows = []
+    cdef dict line_dict # Loop variable type
+    cdef str line, content_raw, content_cleaned, line_id
+    cdef cython.Py_ssize_t space_index
     for line_dict in batch_data:
-        line = line_dict['line'] # Already stripped in collection phase
-        # Efficiently split '@@id content'
-        if line.startswith('@@') and ' ' in line:
-             # Find the first space after '@@'
-             space_index = line.find(' ', 2)
-             if space_index != -1:
-                 line_id = line[2:space_index]
-                 content_raw = line[space_index+1:]
-                 content_cleaned = clean_text(content_raw) # Apply cleaning
-
-                 rows.append({
-                     'id': line_id,
-                     'content': content_cleaned,
-                     'file': line_dict.get('file', 'unknown'), # Use .get for safety
-                     'file_order': line_dict['file_order'],
-                     'line_num': line_dict['line_num'],
-                     'sequence': line_dict['sequence']
-                 })
-             else: # Line is like "@@id" with no space/content
-                  logger.debug(f"Skipping line with '@@' but no content: {line[:100]}...")
-        else: # Should not happen if collected correctly, but safety check
-             logger.warning(f"Skipping unexpected line format in batch: {line[:100]}...")
-
-    # logger.debug(f"Worker {os.getpid()} finished batch. Produced {len(rows)} rows.")
-    # Explicitly delete input batch data in worker before returning
-    # del batch_data # This might help worker memory, test impact
-    # gc.collect() # Use cautiously
+        line = line_dict['line']
+        space_index = line.find(' ', 2)
+        if space_index != -1:
+            line_id = line[2:space_index]
+            content_raw = line[space_index+1:]
+            content_cleaned = clean_text_cython(content_raw)
+            rows.append({
+                'id': line_id, 'content': content_cleaned,
+                'file': line_dict.get('file', 'unknown'),
+                'file_order': line_dict.get('file_order', 0),
+                'line_num': line_dict.get('line_num', 0),
+                'sequence': line_dict.get('sequence', 0)
+            })
     return rows
 
-
-def _save_temp_dataframe(df: pd.DataFrame, temp_file_path: str) -> bool:
-    """Helper to save a dataframe chunk, returns success status."""
+def _get_temp_dir(suffix: str) -> Optional[str]:
+    temp_dir = f"{TEMP_DIR_BASE}_{suffix}_{os.getpid()}_{int(time.time())}"
+    if os.path.exists(temp_dir): shutil.rmtree(temp_dir, ignore_errors=True)
     try:
-        # Use Parquet for intermediate files - often faster and more space efficient than CSV
-        df.to_parquet(temp_file_path, index=False, engine='pyarrow', compression='snappy')
-        # df.to_csv(temp_file_path, index=False) # CSV Alternative
-        logger.debug(f"Saved temporary batch to {temp_file_path}")
+        os.makedirs(temp_dir)
+        return temp_dir
+    except OSError as e:
+        logger.error(f"Cannot create temp dir {temp_dir}: {e}")
+        return None
+
+def _cleanup_temp_dir(temp_dir: Optional[str]):
+    if temp_dir and os.path.exists(temp_dir):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.debug(f"Removed temp dir: {temp_dir}")
+
+def _save_temp_parquet(df: pd.DataFrame, temp_file: str) -> bool:
+    cdef object table # Use object for Arrow Table
+    try:
+        # Use object for table as well
+        table = pa.Table.from_pandas(df, preserve_index=False)
+        pq.write_table(table, temp_file, compression='snappy')
         return True
-    except Exception as e:
-        logger.error(f"Failed to save temporary batch to {temp_file_path}: {e}")
-        return False
+    except Exception as e: logger.error(f"Failed to save {temp_file}: {e}"); return False
 
-def _combine_temp_files(temp_files: List[str], final_columns: List[str], dtypes: Dict[str, Any]) -> pd.DataFrame:
-    """Helper to combine temporary Parquet/CSV files into a single DataFrame."""
-    cdef:
-        list dfs_to_concat = []
-        object df_chunk, combined_df
-        str temp_file
-        bint success = True
+def _combine_temp_parquets(temp_files: List[str], dtypes: Dict[str, Any]) -> pd.DataFrame:
+    if not temp_files: return pd.DataFrame(columns=dtypes.keys()).astype(dtypes)
+    logger.info(f"Combining {len(temp_files)} temporary Parquet files...")
+    cdef list tables = []
+    cdef list final_cols = list(dtypes.keys())
+    cdef str f
+    # Use object for table types
+    cdef object table_chunk
+    cdef object combined_table
+    cdef object combined_df # Keep as object for DataFrame reference
 
-    logger.info(f"Combining {len(temp_files)} temporary batch files...")
+    for f in temp_files:
+        try:
+            table_chunk = pq.read_table(f, columns=final_cols)
+            tables.append(table_chunk)
+        except Exception as e: logger.warning(f"Skipping corrupt/missing temp file {f}: {e}")
+
+    if not tables: return pd.DataFrame(columns=final_cols).astype(dtypes)
+
     try:
-        for temp_file in temp_files:
-            try:
-                # Read Parquet intermediate file
-                df_chunk = pd.read_parquet(temp_file, columns=final_columns)
-                # df_chunk = pd.read_csv(temp_file) # CSV Alternative
-                dfs_to_concat.append(df_chunk)
-            except FileNotFoundError:
-                 logger.warning(f"Temporary file not found: {temp_file}. Skipping.")
-                 success = False # Mark as potentially incomplete
-            except Exception as e:
-                 logger.error(f"Error reading temporary file {temp_file}: {e}. Skipping.")
-                 success = False # Mark as potentially incomplete
-
-        if not dfs_to_concat:
-             logger.error("No temporary files could be read. Combined DataFrame will be empty.")
-             return pd.DataFrame(columns=final_columns).astype(dtypes) # Return empty DF with correct structure
-
-        # Concatenate all chunks
-        combined_df = pd.concat(dfs_to_concat, ignore_index=True)
-
-        # Re-apply desired dtypes (important after concat)
-        for col, dtype in dtypes.items():
-             if col in combined_df.columns:
-                try:
-                    combined_df.loc[col] = combined_df[col].astype(dtype)
-                except Exception as e:
-                     logger.warning(f"Could not apply dtype '{dtype}' to column '{col}' after combining: {e}")
-
-        logger.info(f"Successfully combined temporary files into DataFrame with {len(combined_df)} rows.")
-        if not success:
-            logger.warning("Combined DataFrame may be incomplete due to errors reading temporary files.")
-
+        logger.info("Concatenating Arrow tables...")
+        combined_table = pa.concat_tables(tables)
+        del tables; gc.collect()
+        logger.info("Converting to Pandas DataFrame...")
+        combined_df = combined_table.to_pandas(self_destruct=True, zero_copy_only=False)
+        del combined_table; gc.collect()
+        logger.info("Applying final dtypes...")
+        # Using combined_df.astype directly is generally fine here
+        combined_df = combined_df.astype(dtypes, errors='ignore')
+        # Use .loc for single-column modification after initial cast
+        if 'type' in combined_df.columns and combined_df['type'].dtype == 'object':
+             # Use .loc to modify the specific column 'type'
+             combined_df.loc[:, 'type'] = combined_df['type'].astype('category')
+        logger.info(f"Combined {len(combined_df)} rows. RAM: {combined_df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
+        # Return the Python object; type hint in signature informs Python side
         return combined_df
-
-    except MemoryError:
-        logger.error("MemoryError during final concatenation of temporary files!")
-        # Critical error, likely cannot proceed
-        return pd.DataFrame() # Return empty DF
     except Exception as e:
-        logger.error(f"Unexpected error during final concatenation: {e}")
-        return pd.DataFrame() # Return empty DF
-    finally:
-        # Clean up temporary files regardless of success/failure
-        logger.info("Cleaning up temporary batch files...")
-        for temp_file in temp_files:
-            try:
-                if os.path.exists(temp_file):
-                    os.remove(temp_file)
-            except Exception as e:
-                logger.warning(f"Could not remove temporary file {temp_file}: {e}")
-        # Explicit GC after cleanup
-        del dfs_to_concat # Clear list of dataframes
-        gc.collect()
+        logger.error(f"Error combining temp files: {e}")
+        return pd.DataFrame(columns=final_cols).astype(dtypes)
+
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def parse_content_lines_sequential(line_dicts: List[Dict[str, Any]], batch_size: cython.int) -> pd.DataFrame:
-    """
-    Parse content lines sequentially, saving intermediate results to disk to conserve memory.
-
-    Args:
-        line_dicts: The full list of collected line dictionaries.
-        batch_size: How many lines to process in each sequential step.
-
-    Returns:
-        A Pandas DataFrame containing the parsed content.
-    """
     cdef:
-        cython.int i, batch_num, total_lines, batch_count
-        list batch, rows, temp_files = []
-        str temp_dir = "temp_batches"
-        str temp_file_path
-        object temp_df # Use object for DataFrame type
-        dict dtypes = {'id': str, 'content': str, 'file': str, 'file_order': 'int32', 'line_num': 'int32', 'sequence': 'int64'}
+        cython.int total_lines = len(line_dicts)
+        list temp_files = []
+        # Use 'object' for DataFrame references in cdef
+        object temp_df = None # Initialize to None
+        object combined_df = None # Initialize to None
+        str temp_dir = None
+        str temp_file = ""
+        list batch = []
+        list rows = []
+        cython.int i = 0 # Initialize loop variable
+        cython.int batch_num = 0 # Initialize
+        cython.int batch_count = 0 # Initialize
 
+    if total_lines == 0: return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
+    logger.info(f"Starting sequential parsing ({total_lines} lines, batch size {batch_size}).")
 
-    total_lines = len(line_dicts)
-    if total_lines == 0:
-        logger.warning("No content lines provided to sequential parser.")
-        return pd.DataFrame()
-
-    logger.info(f"Starting sequential parsing of {total_lines} lines with batch size {batch_size}.")
-
-    # Create a temporary directory for batch files
-    try:
-        if not os.path.exists(temp_dir):
-            os.makedirs(temp_dir)
-        else: # Clean up old temp files if directory exists
-             for old_file in os.listdir(temp_dir):
-                 if old_file.startswith("temp_batch_") and (old_file.endswith(".parquet") or old_file.endswith(".csv")):
-                     try: os.remove(os.path.join(temp_dir, old_file))
-                     except: pass
-    except OSError as e:
-        logger.error(f"Could not create or clean temporary directory {temp_dir}: {e}. Aborting sequential parse.")
-        return pd.DataFrame()
-
-    batch_count = (total_lines + batch_size - 1) // batch_size
+    temp_dir = _get_temp_dir("seq")
+    if not temp_dir: return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
 
     try:
+        batch_count = (total_lines + batch_size - 1) // batch_size
         for i in range(0, total_lines, batch_size):
-            batch_num = i // batch_size + 1
-            batch = line_dicts[i : i + batch_size]
-
-            logger.info(f"Processing sequential batch {batch_num}/{batch_count} ({len(batch)} lines)")
-
-            # Process this batch in the current process
+            batch_num = (i // batch_size) + 1
+            logger.info(f"Processing sequential batch {batch_num}/{batch_count}")
+            batch = line_dicts[i : min(i + batch_size, total_lines)]
             rows = process_content_batch(batch)
-
+            del batch; gc.collect()
             if rows:
                 try:
-                    # Create a temporary DataFrame
-                    temp_df = pd.DataFrame(rows)
-                    # Apply dtypes immediately
-                    for col, dtype in dtypes.items():
-                        if col in temp_df.columns:
-                            try: temp_df.loc[col] = temp_df[col].astype(dtype)
-                            except: pass # Ignore dtype errors for now
-
-                    # Define temp file path
-                    temp_file_path = os.path.join(temp_dir, f"temp_batch_{batch_num}.parquet")
-                    # Save to Parquet (or CSV)
-                    if _save_temp_dataframe(temp_df, temp_file_path):
-                        temp_files.append(temp_file_path)
-
-                except MemoryError:
-                    logger.error(f"MemoryError creating or saving DataFrame for batch {batch_num}. Skipping batch.")
-                    # Continue to next batch if possible
-                except Exception as e:
-                    logger.error(f"Error processing or saving batch {batch_num}: {e}. Skipping batch.")
+                    # Assign Python object to temp_df
+                    temp_df = pd.DataFrame(rows).astype(DTYPES_CONTENT, errors='ignore')
+                    temp_file = os.path.join(temp_dir, f"batch_{batch_num}.parquet")
+                    if _save_temp_parquet(temp_df, temp_file): temp_files.append(temp_file)
+                except Exception as e: logger.error(f"Error saving sequential batch {batch_num}: {e}")
                 finally:
-                    # Clear memory explicitly
-                    del temp_df
-                    del rows
-                    del batch # Clear slice
+                    # 'del temp_df' works correctly on the object reference
+                    if temp_df is not None: del temp_df; temp_df = None
+                    if rows: del rows; rows = [] # Clear list too
                     gc.collect()
-            else:
-                logger.warning(f"Batch {batch_num} resulted in no valid rows.")
-                del batch # Clear slice
-                gc.collect()
-        
-            # Combine all temporary files
-            if temp_files:
-                combined_df = _combine_temp_files(temp_files, list(dtypes.keys()), dtypes)
-                return combined_df
-            else:
-                logger.warning("No valid data batches were processed successfully.")
-                return pd.DataFrame()
-                
-    except Exception as e:
-        logger.error(f"Unexpected error during sequential processing loop: {str(e)}")
-        return pd.DataFrame() # Return empty on major failure
-    finally:
-        # Ensure temp dir is cleaned up if possible, even on error
-        try:
-            if os.path.exists(temp_dir) and not temp_files: # Only remove if empty or fully processed
-                pass # Keep temp files if _combine failed midway for debugging? Or remove always?
-            # Let's remove always for cleanliness
-            if os.path.exists(temp_dir):
-                import shutil
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                logger.info(f"Removed temporary directory: {temp_dir}")
-        except Exception as e:
-            logger.warning(f"Could not remove temporary directory {temp_dir}: {e}")
 
+        combined_df = _combine_temp_parquets(temp_files, DTYPES_CONTENT)
+    except Exception as e:
+        logger.error(f"Error during sequential processing loop: {e}")
+        combined_df = pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
+    finally:
+        _cleanup_temp_dir(temp_dir)
+    # Return the Python object
+    return combined_df
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def parse_content_lines_parallel(line_dicts: List[Dict[str, Any]], batch_size: cython.int, num_workers: cython.int) -> pd.DataFrame:
-    """
-    Parse content lines into a DataFrame using parallel processing, with sequential fallback.
-
-    Args:
-        line_dicts: List of collected line dictionaries.
-        batch_size: Size of batches submitted to workers.
-        num_workers: Number of worker processes.
-
-    Returns:
-        A Pandas DataFrame containing the parsed content.
-    """
     cdef:
         cython.int total_lines = len(line_dicts)
-        double available_memory_gb = get_available_memory()
-        list batches, all_rows = []
-        cython.int chunk_size_batches # How many batches to submit to pool at once
-        cython.int batch_chunk_idx, num_batch_chunks
-        list batch_chunk, results
-        object pool # multiprocessing.Pool object
-        dict dtypes = {'id': str, 'content': str, 'file': str, 'file_order': 'int32', 'line_num': 'int32', 'sequence': 'int64'}
-        object df # Use object for DataFrame type
-        double mem_before, mem_after, mem_used_gb
-        cython.int i # Loop variable
-        # ---- Added flag to track successful parallel completion ----
+        double available_memory_gb_start = get_available_memory()
+        double estimated_mem_needed_gb
+        list batches = []
+        list all_rows = []
+        str temp_dir = None
+        # Use object for DataFrame references
+        object df = None
+        object sequential_df = None
+        object partial_df = None
+        object final_df = None
         bint parallel_completed_successfully = False
+        cython.int chunk_size_batches = 0 # Initialize
+        cython.int num_batch_chunks = 0 # Initialize
+        double mem_before_chunk = 0.0 # Initialize
+        double mem_after_chunk = 0.0 # Initialize
+        double low_mem_threshold = 0.0 # Initialize
+        cython.int batch_chunk_idx = 0 # Initialize
+        cython.int start_idx = 0 # Initialize
+        cython.int end_idx = 0 # Initialize
+        list batch_chunk = []
+        object pool # multiprocessing.Pool object
+        object results_iterator # Iterator object
+        list batch_rows = []
+        str temp_fallback_file = None
+        cython.longlong first_remaining_line_idx = 0 # Initialize
+        list remaining_line_dicts = []
+        cython.Py_ssize_t imap_chunksize = 1 # Initialize with a default
 
+    if total_lines == 0: return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
 
-    if total_lines == 0:
-        logger.warning("No content lines provided to parallel parser.")
-        return pd.DataFrame()
-
-    # Memory check: If estimated needs are very high vs available memory, or too many lines, go sequential
-    if total_lines > 500_000 and available_memory_gb < 8.0:
-        logger.warning(f"Large dataset ({total_lines} lines) and limited memory ({available_memory_gb:.1f} GB). Switching to sequential parsing.")
-        # Pass line_dicts directly, it hasn't been deleted yet
+    estimated_mem_needed_gb = (total_lines * 15) / (1024**2)
+    if estimated_mem_needed_gb > available_memory_gb_start * 0.7:
+        logger.warning(f"High estimated memory need. Switching to sequential parsing.")
         return parse_content_lines_sequential(line_dicts, batch_size)
 
-    logger.info(f"Starting parallel parsing of {total_lines} lines.")
-    logger.info(f"Using batch size: {batch_size}, workers: {num_workers}")
-
-    # Split lines into batches for workers
-    batches = [line_dicts[i : i + batch_size] for i in range(0, total_lines, batch_size)]
-    # --- REMOVED: del line_dicts --- We need it for fallback
-    # gc.collect() # Keep gc.collect after creating potentially large 'batches' list
-    logger.info(f"Created {len(batches)} batches.")
-
-
-    # Determine chunk size for submitting batches to the pool
-    chunk_size_batches = max(1, min(BATCH_PROCESSING_CHUNK_SIZE, (len(batches) + num_workers - 1) // num_workers))
-    num_batch_chunks = (len(batches) + chunk_size_batches - 1) // chunk_size_batches
-    logger.info(f"Processing batches in {num_batch_chunks} chunks of up to {chunk_size_batches} batches each.")
+    logger.info(f"Starting parallel parsing ({total_lines} lines, Batch={batch_size}, Workers={num_workers})")
+    temp_dir = _get_temp_dir("par")
 
     try:
-        mem_before = get_available_memory()
+        batches = [line_dicts[i : min(i + batch_size, total_lines)] for i in range(0, total_lines, batch_size)]
+        logger.info(f"Created {len(batches)} batches.")
+    except MemoryError:
+        logger.error("MemoryError creating batches. Falling back to sequential.")
+        gc.collect()
+        _cleanup_temp_dir(temp_dir)
+        return parse_content_lines_sequential(line_dicts, batch_size)
 
+    chunk_size_batches = max(1, min(BATCH_PROCESSING_CHUNK_SIZE, (len(batches) + num_workers - 1) // num_workers))
+    num_batch_chunks = (len(batches) + chunk_size_batches - 1) // chunk_size_batches
+    logger.info(f"Processing in {num_batch_chunks} batch chunks...")
+
+    try:
+        mem_before_chunk = get_available_memory()
         for batch_chunk_idx in range(num_batch_chunks):
             start_idx = batch_chunk_idx * chunk_size_batches
             end_idx = min(start_idx + chunk_size_batches, len(batches))
             batch_chunk = batches[start_idx:end_idx]
-
             if not batch_chunk: continue
 
-            logger.info(f"Processing batch chunk {batch_chunk_idx + 1}/{num_batch_chunks} ({len(batch_chunk)} batches)...")
+            logger.info(f"Processing batch chunk {batch_chunk_idx + 1}/{num_batch_chunks}...")
+            try:
+                with multiprocessing.Pool(processes=num_workers, maxtasksperchild=30) as pool:
+                    # Calculate imap_chunksize inside the loop where variables are defined
+                    imap_chunksize = max(1, len(batch_chunk) // (num_workers * 2))
+                    results_iterator = pool.imap_unordered(process_content_batch, batch_chunk, chunksize=imap_chunksize)
+                    for batch_rows in results_iterator:
+                         if batch_rows: all_rows.extend(batch_rows)
+            finally:
+                 # Ensure cleanup even if inner try fails
+                 if 'batch_chunk' in locals(): del batch_chunk
+                 if 'results_iterator' in locals(): del results_iterator
+                 gc.collect()
 
-            # Create pool inside the loop, use maxtasksperchild
-            with multiprocessing.Pool(processes=num_workers, maxtasksperchild=20) as pool:
-                # Use imap_unordered for better memory usage potential
-                imap_chunksize = max(1, len(batch_chunk) // (num_workers * 4)) # Heuristic
-                results_iterator = pool.imap_unordered(process_content_batch, batch_chunk, chunksize=imap_chunksize)
+            mem_after_chunk = get_available_memory()
+            logger.info(f"Finished chunk {batch_chunk_idx + 1}. Rows: {len(all_rows)}. Available RAM: {mem_after_chunk:.1f} GB")
 
-                # Consume results as they arrive
-                for batch_rows in results_iterator:
-                     if batch_rows: # Only extend if the batch produced rows
-                         all_rows.extend(batch_rows)
-
-            # Memory check and potential fallback after processing a chunk
-            mem_after = get_available_memory()
-            mem_used_gb = mem_before - mem_after
-            logger.info(f"Finished batch chunk {batch_chunk_idx + 1}. Rows collected so far: {len(all_rows)}. Approx memory used by chunk: {mem_used_gb:.2f} GB. Available: {mem_after:.1f} GB.")
-
-            if mem_after < max(1.0, available_memory_gb * 0.1): # If less than 1GB or 10% of initial available memory remains
-                logger.warning(f"Low memory detected ({mem_after:.1f} GB). Falling back to sequential processing for remaining batches.")
-
-                logger.info("Saving currently collected rows to temporary file before sequential fallback...")
-                temp_fallback_df = pd.DataFrame() # Placeholder
+            low_mem_threshold = max(0.8, available_memory_gb_start * 0.15)
+            if mem_after_chunk < low_mem_threshold:
+                logger.warning(f"Low memory detected ({mem_after_chunk:.1f} GB). Falling back to sequential for remaining.")
                 temp_fallback_file = None
-                if all_rows:
-                     try:
-                         temp_fallback_df = pd.DataFrame(all_rows)
-                         for col, dtype in dtypes.items():
-                             if col in temp_fallback_df.columns:
-                                 try: temp_fallback_df.loc[col] = temp_fallback_df[col].astype(dtype)
-                                 except: pass
-                         temp_fallback_file = "temp_fallback_partial.parquet"
-                         _save_temp_dataframe(temp_fallback_df, temp_fallback_file)
-                         all_rows = [] # Clear memory
-                         gc.collect()
-                     except Exception as save_err:
-                         logger.error(f"Could not save partial results before fallback: {save_err}. Proceeding without saving.")
-                         temp_fallback_file = None # Ensure it's None
+                if all_rows and temp_dir:
+                    try:
+                        # Use object for partial_df
+                        partial_df = pd.DataFrame(all_rows).astype(DTYPES_CONTENT, errors='ignore')
+                        temp_fallback_file = os.path.join(temp_dir, "fallback_partial.parquet")
+                        if _save_temp_parquet(partial_df, temp_fallback_file): logger.info("Saved partial results.")
+                        else: temp_fallback_file = None
+                        # 'del partial_df' works on the object
+                        del partial_df; partial_df = None
+                        all_rows = []; gc.collect()
+                    except Exception as e: logger.error(f"Failed saving partial results: {e}"); temp_fallback_file = None
 
-                # Get the actual line dictionaries for the remaining batches
-                remaining_line_dicts = []
-                logger.info("Gathering line dictionaries for remaining batches...")
-                try:
-                    current_line_index = end_idx * batch_size # Estimate starting index in original line_dicts
-                    for i in range(batch_chunk_idx + 1, num_batch_chunks):
-                         r_start_idx = i * chunk_size_batches
-                         r_end_idx = min(r_start_idx + chunk_size_batches, len(batches))
-                         for batch in batches[r_start_idx:r_end_idx]:
-                              remaining_line_dicts.extend(batch) # Extend directly from batch data
-
-                    # ---- Alternatively, reslice original line_dicts ----
-                    # This assumes batches were created sequentially from line_dicts
-                    # first_remaining_line_idx = end_idx * batch_size # Index of first line NOT processed in parallel
-                    # if first_remaining_line_idx < total_lines:
-                    #      remaining_line_dicts = line_dicts[first_remaining_line_idx:]
-                    # else:
-                    #      remaining_line_dicts = [] # Should not happen if loop logic is correct
-                    # logger.info(f"Gathered {len(remaining_line_dicts)} remaining lines for sequential processing.")
-
-                except MemoryError:
-                     logger.error("MemoryError gathering remaining line dictionaries for sequential fallback.")
-                     if temp_fallback_file:
-                         logger.warning("Returning only data processed before low memory condition.")
-                         return _combine_temp_files([temp_fallback_file], list(dtypes.keys()), dtypes)
-                     else:
-                         return pd.DataFrame() # Nothing could be saved/processed
-                except Exception as gather_err:
-                     logger.error(f"Error gathering remaining lines: {gather_err}")
-                     # Decide how to proceed - maybe return partial if saved?
-                     if temp_fallback_file:
-                         logger.warning("Returning only data processed before low memory condition due to error gathering remaining lines.")
-                         return _combine_temp_files([temp_fallback_file], list(dtypes.keys()), dtypes)
-                     else:
-                         return pd.DataFrame()
-
-                # Run sequential process on remaining lines
+                first_remaining_line_idx = <cython.longlong>end_idx * batch_size
+                remaining_line_dicts = line_dicts[first_remaining_line_idx:] if first_remaining_line_idx < total_lines else []
+                # Use object for sequential_df
                 sequential_df = parse_content_lines_sequential(remaining_line_dicts, batch_size)
+                del remaining_line_dicts; gc.collect()
 
-                # Clean up remaining data structures
-                del remaining_line_dicts
-                gc.collect()
-
-                # Combine partial parallel results (if saved) with sequential results
                 if temp_fallback_file:
-                     partial_df = _combine_temp_files([temp_fallback_file], list(dtypes.keys()), dtypes)
-                     final_df = pd.concat([partial_df, sequential_df], ignore_index=True)
-                     del partial_df # Clean up intermediate df
-                else: # No partial results saved
-                     final_df = sequential_df
+                    # Use object for partial_df
+                    partial_df = _combine_temp_parquets([temp_fallback_file], DTYPES_CONTENT)
+                    # Use object for final_df
+                    final_df = pd.concat([partial_df, sequential_df], ignore_index=True).astype(DTYPES_CONTENT, errors='ignore')
+                    # 'del partial_df' works
+                    del partial_df; partial_df = None
+                else: final_df = sequential_df
 
-                # Re-apply dtypes one last time after concat
-                if not final_df.empty:
-                    for col, dtype in dtypes.items():
-                        if col in final_df.columns:
-                            try: final_df.loc[col] = final_df[col].astype(dtype)
-                            except: pass
+                logger.info(f"Low memory fallback complete. Final rows: {len(final_df)}")
+                parallel_completed_successfully = False
+                del line_dicts, batches; gc.collect()
+                _cleanup_temp_dir(temp_dir)
+                return final_df
 
-                logger.info(f"Low memory fallback complete. Final DataFrame has {len(final_df)} rows.")
-                # --- Important: Set flag to indicate parallel part didn't fully complete ---
-                parallel_completed_successfully = False # Set to false as we bailed early
-                # --- Clean up original line_dicts here as it's no longer needed ---
-                del line_dicts
-                gc.collect()
-                return final_df # Exit outer loop and function, returning combined result
+            mem_before_chunk = mem_after_chunk
 
-            # Update memory baseline for next chunk check
-            mem_before = mem_after
-
-            # Clean up memory after chunk processing
-            del batch_chunk
-            del results_iterator # Ensure iterator is closed/deleted
-            gc.collect()
-
-        # ---- If the loop completes without low-memory fallback ----
         parallel_completed_successfully = True
 
-    except (MemoryError, OSError, Exception) as e:
-        logger.error(f"Fatal error during parallel batch processing: {type(e).__name__} - {e}")
-        logger.info("Attempting fallback to full sequential batch processing using original data...")
-
-        # ---- Fallback logic ----
-        # At this point, line_dicts should still exist because we didn't delete it yet.
+    except Exception as e:
+        logger.error(f"Fatal error during parallel processing: {e}", exc_info=True)
+        logger.info("Attempting full sequential fallback...")
+        parallel_completed_successfully = False
         try:
-            # Directly call sequential parse with the original line_dicts
-            # No need for NameError check here anymore.
-            logger.info(f"Falling back to process all {len(line_dicts)} lines sequentially.")
-            sequential_fallback_df = parse_content_lines_sequential(line_dicts, batch_size)
-            # --- Clean up original line_dicts after fallback attempt ---
-            del line_dicts
-            gc.collect()
-            return sequential_fallback_df # Return result of sequential processing
-
+            # Use object for final_df
+            final_df = parse_content_lines_sequential(line_dicts, batch_size)
         except Exception as fallback_err:
-             logger.error(f"Sequential fallback also failed: {fallback_err}")
-             # --- Clean up original line_dicts even if fallback fails ---
-             try: del line_dicts
-             except NameError: pass # Already deleted or never existed (edge case)
-             gc.collect()
-             # Try to return partially collected rows if any exist from before the fatal error
-             if all_rows:
-                  logger.warning("Attempting to return partially collected rows from before the fatal error.")
-                  try:
-                      df_partial = pd.DataFrame(all_rows)
-                      for col, dtype in dtypes.items():
-                           if col in df_partial.columns:
-                               try: df_partial[col] = df_partial[col].astype(dtype)
-                               except: pass
-                      return df_partial
-                  except Exception as partial_err:
-                       logger.error(f"Could not create DataFrame from partial rows: {partial_err}")
-                       return pd.DataFrame() # Give up, return empty
-             else:
-                  return pd.DataFrame() # Give up, return empty
-
-
-    # ---- If parallel processing completed successfully (no low memory fallback, no fatal error) ----
-    if parallel_completed_successfully:
-        # --- Clean up original line_dicts NOW, after successful parallel run ---
-        logger.info("Parallel processing successful. Deleting original line dictionaries list.")
-        del line_dicts
+            logger.error(f"Sequential fallback also failed: {fallback_err}")
+            final_df = pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
+        # Cleanup lists and objects that might hold significant memory
+        if 'line_dicts' in locals(): del line_dicts
+        if 'batches' in locals(): del batches
+        if 'all_rows' in locals(): del all_rows
         gc.collect()
+        _cleanup_temp_dir(temp_dir)
+        return final_df
 
-        if not all_rows:
-            logger.warning("Parallel processing completed successfully, but no valid data rows were generated.")
-            return pd.DataFrame()
+    # ---- If parallel completed fully ----
+    if parallel_completed_successfully:
+        logger.info("Parallel processing successful. Cleaning up.")
+        # Cleanup lists and objects that might hold significant memory
+        if 'line_dicts' in locals(): del line_dicts
+        if 'batches' in locals(): del batches
+        gc.collect()
+        _cleanup_temp_dir(temp_dir)
 
-        logger.info(f"Parallel processing finished. Creating final DataFrame from {len(all_rows)} collected rows...")
+        if not all_rows: return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
+        logger.info(f"Creating final DataFrame from {len(all_rows)} rows...")
         try:
-            df = pd.DataFrame(all_rows)
-            # Apply dtypes
-            for col, dtype in dtypes.items():
-                if col in df.columns:
-                    try:
-                        df.loc[col] = df[col].astype(dtype)
-                    except Exception as e:
-                        logger.warning(f"Could not apply dtype '{dtype}' to column '{col}' after parallel processing: {e}")
-
-            logger.info(f"Successfully parsed {len(df)} valid content lines using parallel processing.")
-            # --- Clean up all_rows after creating final DataFrame ---
-            del all_rows
+            # Use object for df
+            df = pd.DataFrame(all_rows).astype(DTYPES_CONTENT, errors='ignore')
+            del all_rows # Free list memory after df creation
             gc.collect()
+            logger.info(f"Final DF RAM: {df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
             return df
-        except MemoryError:
-            logger.error("MemoryError during final DataFrame creation after successful parallel processing.")
-            del all_rows # Try to free memory
-            gc.collect()
-            return pd.DataFrame() # Return empty
         except Exception as e:
-            logger.error(f"Error creating final DataFrame after parallel processing: {e}")
-            del all_rows # Try to free memory
+            logger.error(f"Error creating final DataFrame: {e}")
+            if 'all_rows' in locals(): del all_rows # Ensure cleanup on error too
             gc.collect()
-            return pd.DataFrame() # Return empty
+            return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
     else:
-         # This case should theoretically not be reached if fallbacks return correctly,
-         # but as a safeguard:
-         logger.warning("Parallel processing flag indicates incompletion, but no fallback path returned. Returning empty DataFrame.")
-         try: del line_dicts
-         except NameError: pass
-         gc.collect()
-         return pd.DataFrame()
+        logger.error("Reached end of parallel function unexpectedly.")
+        _cleanup_temp_dir(temp_dir)
+        return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
 
-# --- Merging and Formatting ---
+
+# --- Merging & Formatting ---
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def merge_data(content_df: pd.DataFrame, sources_df: pd.DataFrame) -> pd.DataFrame:
-    """Merges content and sources DataFrames with memory usage logging."""
-    cdef:
-        object merged_df # Use object for DataFrame type
-        double initial_memory = content_df.memory_usage(deep=True).sum() / (1024**2) + \
-                               sources_df.memory_usage(deep=True).sum() / (1024**2)
-
-    if content_df.empty or sources_df.empty:
-        logger.warning("One or both DataFrames are empty, cannot merge.")
-        return pd.DataFrame()
-
-    logger.info(f"Starting merge. Content DF: {len(content_df)} rows, Sources DF: {len(sources_df)} rows.")
-    logger.info(f"Approximate memory usage before merge: {initial_memory:.1f} MB")
-
+    if content_df.empty or sources_df.empty: return pd.DataFrame(columns=DTYPES_MERGED.keys()).astype(DTYPES_MERGED)
+    logger.info(f"Merging {len(content_df)} content rows with {len(sources_df)} sources.")
+    # Use object for DataFrame reference
+    cdef object merged_df = None
     try:
-        # Ensure 'id' column exists and is string type in both
-        if 'id' not in content_df.columns or 'id' not in sources_df.columns:
-             logger.error("Missing 'id' column in one of the DataFrames for merging.")
-             return pd.DataFrame()
-        if content_df['id'].dtype != 'object': content_df['id'] = content_df['id'].astype(str)
-        if sources_df['id'].dtype != 'object': sources_df['id'] = sources_df['id'].astype(str)
+        # Use .loc for modifying columns to avoid ChainedAssignmentWarning
+        if 'id' in content_df.columns and content_df['id'].dtype != 'object':
+             content_df.loc[:, 'id'] = content_df['id'].astype(str)
+        if 'id' in sources_df.columns and sources_df['id'].dtype != 'object':
+             sources_df.loc[:, 'id'] = sources_df['id'].astype(str)
 
-        merged_df = pd.merge(content_df, sources_df, on='id', how='inner') # Inner join common IDs
+        merged_df = pd.merge(content_df, sources_df, on='id', how='inner')
+        logger.info(f"Merge complete ({len(merged_df)} rows). Sorting by sequence...")
+        if 'sequence' in merged_df.columns:
+            merged_df = merged_df.sort_values('sequence', ignore_index=True)
 
-        final_memory = merged_df.memory_usage(deep=True).sum() / (1024**2)
-        logger.info(f"Merge complete. Result: {len(merged_df)} rows.")
-        logger.info(f"Approximate memory usage after merge: {final_memory:.1f} MB")
-
-        # Optimize merged DataFrame memory
-        # Convert low-cardinality columns inherited from sources_df back to category if needed
+        # First apply general dtypes
+        merged_df = merged_df.astype(DTYPES_MERGED, errors='ignore')
+        # Then use .loc for specific column modifications if needed (e.g., category)
         if 'type' in merged_df.columns and merged_df['type'].dtype == 'object':
-             merged_df.loc['type'] = merged_df['type'].astype('category')
-
-        # Sort by original sequence to maintain order
-        logger.info("Sorting merged data by sequence...")
-        merged_df = merged_df.sort_values('sequence', ignore_index=True) # ignore_index resets index
-        logger.info("Sorting complete.")
-
+             merged_df.loc[:, 'type'] = merged_df['type'].astype('category')
+        logger.info(f"Final Merged DF RAM: {merged_df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
         return merged_df
-
-    except MemoryError:
-        logger.error("MemoryError during DataFrame merge!")
-        gc.collect() # Attempt to free memory
-        return pd.DataFrame() # Return empty on failure
     except Exception as e:
-        logger.error(f"Error during DataFrame merge: {e}")
-        return pd.DataFrame() # Return empty on failure
+        logger.error(f"Error during merge/sort: {e}")
+        return pd.DataFrame(columns=DTYPES_MERGED.keys()).astype(DTYPES_MERGED)
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
 def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
-    """
-    Format merged data into the target validation structure, processing in batches.
-
-    Args:
-        merged_df: The merged and sorted DataFrame.
-
-    Returns:
-        A list of dictionaries in the validation format.
-    """
-    cdef:
-        list validation_format = []
-        list conversation
-        cython.int start_idx, end_idx, total_rows, batch_size, batch_num = 0, total_batches
-        object batch_df = None # Initialize batch_df to None
-        dict row_dict # Not used currently
-        object row # Variable for itertuples result
-        cython.Py_ssize_t index # Not used with itertuples(index=False)
-        list required_cols = ['content', 'source'] # Define required cols once
-
-    total_rows = len(merged_df)
-    if total_rows == 0:
-        logger.warning("No data in merged DataFrame to format.")
+    if merged_df.empty: return []
+    cdef list required_cols = ['content', 'source', 'year', 'title', 'id']
+    if not all(col in merged_df.columns for col in required_cols):
+        logger.error(f"Missing columns for formatting: {set(required_cols) - set(merged_df.columns)}")
         return []
 
-    batch_size = 10000
-    total_batches = (total_rows + batch_size - 1) // batch_size
-
-    logger.info(f"Formatting {total_rows} rows for validation structure in {total_batches} batches...")
+    logger.info(f"Formatting {len(merged_df)} rows for validation structure...")
+    cdef list validation_format = []
+    cdef object row # Use object for itertuples result
+    cdef str content_val, source_val, year_val, title_val, gpt_response
+    cdef list conversation
 
     try:
-        for start_idx in range(0, total_rows, batch_size):
-            batch_num = start_idx // batch_size + 1
-            end_idx = min(start_idx + batch_size, total_rows)
+        # row will be a Python namedtuple object
+        for row in merged_df.itertuples(index=False):
+            content_val = str(getattr(row, 'content', ''))
+            source_val = str(getattr(row, 'source', 'unknown_source'))
+            year_val = str(getattr(row, 'year', 'unknown_year'))
+            title_val = str(getattr(row, 'title', 'unknown_title')).strip()
 
-            logger.info(f"Formatting validation batch {batch_num}/{total_batches}")
-
-            try: # Add inner try/finally for batch_df cleanup
-                batch_df = merged_df.iloc[start_idx:end_idx]
-
-                # Ensure required columns ('content', 'source') exist before iterating
-                if not all(col in batch_df.columns for col in required_cols):
-                    logger.error(f"Missing required columns {required_cols} in batch {batch_num}. Skipping iteration for this batch.")
-                    # --- Just continue to the finally block for cleanup ---
-                    continue # Skips the 'for row in batch_df.itertuples()' part
-
-                # Iterate using itertuples
-                for row in batch_df.itertuples(index=False):
-                    content_val = str(row.content) if pd.notna(row.content) else ""
-                    source_val = str(row.source) if pd.notna(row.source) else "unknown"
-
-                    conversation = [
-                        {
-                            "from": "human",
-                            "value": content_val
-                        },
-                        {
-                            "from": "gpt",
-                            "value": "Tell the user what dialect this is and provide additional context and learn the dialect." # Fixed template
-                        }
-                    ]
-
-                    validation_format.append({
-                        "conversations": conversation,
-                        "source": source_val,
-                        "score": 0,  # Fixed score
-                    })
-
-            finally:
-                # --- Always cleanup batch_df for the current iteration ---
-                # This block executes whether the try block finished,
-                # hit a 'continue', or raised an exception caught by the outer handler.
-                if batch_df is not None:
-                    # logger.debug(f"Cleaning up batch_df for batch {batch_num}") # Optional debug log
-                    del batch_df
-                    batch_df = None # Reset for next iteration or if error occurs
-                    gc.collect()
-
-        logger.info(f"Successfully formatted {len(validation_format)} records.")
-        return validation_format
-
-    except MemoryError:
-         logger.error(f"MemoryError during validation formatting (around batch {batch_num}). Partial results may be returned.")
-         # No explicit cleanup needed here, finally block within loop handles batch_df
-         return validation_format
+            gpt_response = (f"Source Context: Title='{title_val}', Year='{year_val}', Source ID='{source_val}'. "
+                            f"Task: Identify the dialect of the provided text, give additional context about it, and learn the dialect.")
+            conversation = [{"from": "human", "value": content_val},
+                            {"from": "gpt", "value": gpt_response}]
+            validation_format.append({"conversations": conversation, "source": source_val, "score": 0})
+        logger.info(f"Formatted {len(validation_format)} records.")
     except Exception as e:
-        logger.error(f"Error during validation formatting (around batch {batch_num}): {e}", exc_info=True)
-        # No explicit cleanup needed here, finally block within loop handles batch_df
-        return validation_format
+        logger.error(f"Error during validation formatting: {e}", exc_info=True)
+    return validation_format
 
-# --- Main Processing Orchestration ---
+# --- Main Pipeline ---
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
-def process_data(input_folder: str, sources_file: str, num_workers: cython.int = 0) -> List[Dict[str, Any]]:
-    """
-    Main data processing pipeline function.
-
-    Args:
-        input_folder: Path to the corpora directory.
-        sources_file: Path to the sources.txt file.
-        num_workers: Number of workers for parallel steps (0 for auto).
-
-    Returns:
-        A list of dictionaries in the final validation format, or empty list on failure.
-    """
-    cdef:
-        object sources_df, content_df, merged_df # Pandas objects
-        list all_line_dicts, result
-        cython.int batch_size, optimal_workers
-
+def process_data(input_folder: str, sources_file: str, num_workers: cython.int) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     logger.info("="*20 + " Starting Data Processing Pipeline " + "="*20)
+    start_time = time.time()
+    cdef list train_formatted = [], eval_formatted = []
+    # Use object for DataFrame references in cdef
+    cdef object sources_df = None
+    cdef object content_df = None
+    cdef object merged_df = None
+    cdef object train_df = None
+    cdef object eval_df = None
+    cdef list all_line_dicts = []
+    cdef cython.int batch_size = 0 # Initialize
+    cdef cython.int actual_workers = 0 # Initialize
+    cdef cython.int split_idx = 0 # Initialize
+    cdef double duration = 0.0 # Initialize
 
-    # 1. Parse Sources
-    logger.info("--- Step 1: Parsing Sources File ---")
-    sources_df = parse_sources_file(sources_file)
-    if sources_df.empty:
-        logger.error("Failed to load sources data. Aborting pipeline.")
-        return []
-    gc.collect() # Collect after loading sources
-
-    # 2. Collect Content Lines
-    logger.info("--- Step 2: Collecting Content Lines (Parallel) ---")
-    # Determine workers specifically for collection if needed, or use overall num_workers
-    # Let's use the passed/auto-calculated num_workers for consistency
-    all_line_dicts = collect_content_lines_parallel(input_folder, num_workers)
-    if not all_line_dicts:
-        logger.error("Failed to collect any content lines. Aborting pipeline.")
-        # Clean up sources DF before exiting
-        del sources_df
+    try:
+        sources_df = parse_sources_file(sources_file)
+        if sources_df.empty: raise ValueError("Failed to load sources.")
         gc.collect()
-        return []
-    logger.info(f"Collected {len(all_line_dicts)} total '@@' lines.")
-    gc.collect() # Collect after gathering all lines into memory
 
-    # 3. Parse Content Lines into DataFrame
-    logger.info("--- Step 3: Parsing Content Lines (Parallel/Sequential) ---")
-    # Calculate optimal parameters based on the number of *lines* collected
-    batch_size, optimal_workers = calculate_processing_parameters(len(all_line_dicts), "lines")
-    if num_workers > 0: # Allow user override, capped by calculated optimum
-        actual_parse_workers = max(1, min(num_workers, optimal_workers))
-    else:
-        actual_parse_workers = optimal_workers
-    logger.info(f"Using {actual_parse_workers} workers and batch size {batch_size} for parsing.")
-
-    content_df = parse_content_lines_parallel(all_line_dicts, batch_size, actual_parse_workers)
-    # Crucially, free the large list of line dictionaries now
-    logger.info("Deleting raw collected line data...")
-    del all_line_dicts
-    gc.collect()
-    logger.info("Raw line data deleted.")
-
-    if content_df.empty:
-        logger.error("Failed to parse content lines into DataFrame. Aborting pipeline.")
-        del sources_df
+        all_line_dicts = collect_content_lines_parallel(input_folder, num_workers)
+        if not all_line_dicts: raise ValueError("Failed to collect content lines.")
         gc.collect()
-        return []
-    logger.info(f"Parsed content into DataFrame with {len(content_df)} rows.")
-    gc.collect() # Collect after creating content_df
 
-    # 4. Merge DataFrames
-    logger.info("--- Step 4: Merging Content and Sources ---")
-    merged_df = merge_data(content_df, sources_df)
-    # Free individual DataFrames after merge
-    logger.info("Deleting individual content and sources DataFrames...")
-    del content_df
-    del sources_df
-    gc.collect()
-    logger.info("Individual DataFrames deleted.")
+        batch_size, actual_workers = calculate_processing_parameters(len(all_line_dicts), "lines")
+        if num_workers > 0: actual_workers = max(1, min(num_workers, actual_workers))
+        content_df = parse_content_lines_parallel(all_line_dicts, batch_size, actual_workers)
+        # 'del' works on list object
+        del all_line_dicts; all_line_dicts = [] # Ensure list is cleared
+        gc.collect()
+        if content_df.empty: raise ValueError("Failed to parse content lines.")
+        gc.collect()
 
-    if merged_df.empty:
-        logger.error("Merging failed or resulted in empty DataFrame. Aborting pipeline.")
-        return []
-    logger.info(f"Merging complete. Final merged DataFrame has {len(merged_df)} rows.")
-    gc.collect() # Collect after merge and sort
+        merged_df = merge_data(content_df, sources_df)
+        # 'del' works on object references
+        del content_df; content_df = None
+        del sources_df; sources_df = None
+        gc.collect()
+        if merged_df.empty: raise ValueError("Merging failed or resulted in empty DataFrame.")
+        gc.collect()
 
-    # 5. Format for Validation
-    logger.info("--- Step 5: Formatting Data for Validation ---")
-    result = format_for_validation(merged_df)
-    # Free merged DataFrame after formatting
-    logger.info("Deleting merged DataFrame...")
-    del merged_df
-    gc.collect()
-    logger.info("Merged DataFrame deleted.")
+        logger.info(f"Shuffling {len(merged_df)} rows and splitting ({TRAIN_SPLIT_RATIO*100:.0f}% train)...")
+        # Assignment works correctly with object types
+        merged_df = merged_df.iloc[np.random.RandomState(seed=RANDOM_SEED).permutation(len(merged_df))].reset_index(drop=True)
+        split_idx = int(len(merged_df) * TRAIN_SPLIT_RATIO)
+        train_df = merged_df.iloc[:split_idx]
+        eval_df = merged_df.iloc[split_idx:]
+        logger.info(f"Split complete: Train={len(train_df)}, Eval={len(eval_df)}")
+        # 'del' works on object reference
+        del merged_df; merged_df = None
+        gc.collect()
 
-    if not result:
-        logger.warning("Formatting resulted in empty list, but processing technically succeeded.")
-    else:
-         logger.info(f"Successfully formatted {len(result)} records for validation.")
+        logger.info("Formatting train data...")
+        train_formatted = format_for_validation(train_df)
+        # 'del' works on object reference
+        del train_df; train_df = None
+        gc.collect()
+        logger.info("Formatting eval data...")
+        eval_formatted = format_for_validation(eval_df)
+        # 'del' works on object reference
+        del eval_df; eval_df = None
+        gc.collect()
 
-    logger.info("="*20 + " Data Processing Pipeline Finished " + "="*20)
-    return result
+        if not train_formatted and not eval_formatted:
+            logger.warning("Formatting resulted in no data for train or eval.")
 
+    except Exception as e:
+        logger.critical(f"Pipeline failed: {e}", exc_info=True)
+        # Cleanup on error - check if variables exist before deleting
+        if 'sources_df' in locals() and sources_df is not None: del sources_df
+        if 'content_df' in locals() and content_df is not None: del content_df
+        if 'merged_df' in locals() and merged_df is not None: del merged_df
+        if 'train_df' in locals() and train_df is not None: del train_df
+        if 'eval_df' in locals() and eval_df is not None: del eval_df
+        if 'all_line_dicts' in locals() and all_line_dicts is not None: del all_line_dicts
+        gc.collect()
+        return [], []
+    finally:
+        duration = time.time() - start_time
+        logger.info(f"Pipeline finished in {duration:.2f} seconds.")
+        logger.info("="*20 + " Pipeline Finished " + "="*20)
+
+    return train_formatted, eval_formatted
 
 # --- Exporting ---
 
-def export_to_parquet_and_excel(data: List[Dict[str, Any]], output_basename: str, chunk_size: cython.int = EXPORT_CHUNK_SIZE):
-    """
-    Export data to Parquet and optionally chunked Excel file.
+def _export_single_parquet(data: List[Dict[str, Any]], output_file: str):
+    cdef cython.int total_rows = len(data)
+    if total_rows == 0: return
+    logger.info(f"Exporting {total_rows} records to {output_file}...")
 
-    Args:
-        data: List of processed data records (dictionaries).
-        output_basename: Base name for the output files (e.g., 'output').
-                         '.parquet' and '.xlsx' will be appended.
-        chunk_size: Number of rows per chunk for writing.
-    """
     cdef:
-        cython.int total_rows = len(data)
-        cython.int num_chunks, i, chunk_num, start_idx, end_idx
-        list chunk_data
-        object df_chunk # Pandas DataFrame object
-        str parquet_file = f"{output_basename}.parquet"
-        str excel_file = f"{output_basename}.xlsx"
-        object pq_writer = None # PyArrow ParquetWriter
-        object excel_writer = None # Pandas ExcelWriter
-        object schema = None # Pyarrow schema
-
-    if total_rows == 0:
-        logger.warning("No data provided to export.")
-        return
-
-    logger.info(f"Starting export of {total_rows} records...")
-    logger.info(f"Parquet output: {parquet_file}")
-    logger.info(f"Excel output: {excel_file}")
-
-    num_chunks = (total_rows + chunk_size - 1) // chunk_size
+        # Use object for Schema, Writer, DataFrame, Table
+        object schema = None
+        object writer = None
+        cython.int i = 0 # Initialize
+        cython.int chunk_num = 0 # Initialize
+        cython.int start_idx = 0 # Initialize
+        cython.int end_idx = 0 # Initialize
+        cython.int num_chunks = 0 # Initialize
+        list chunk_data = []
+        object df_chunk = None
+        object table = None
 
     try:
-        # --- Parquet Export (Chunked using PyArrow) ---
-        logger.info(f"Writing Parquet file in {num_chunks} chunks...")
-
+        num_chunks = (total_rows + EXPORT_CHUNK_SIZE - 1) // EXPORT_CHUNK_SIZE
         for i in range(num_chunks):
-            start_idx = i * chunk_size
-            end_idx = min(start_idx + chunk_size, total_rows)
+            start_idx = i * EXPORT_CHUNK_SIZE
+            end_idx = min(start_idx + EXPORT_CHUNK_SIZE, total_rows)
             chunk_data = data[start_idx:end_idx]
+            if not chunk_data: continue
             chunk_num = i + 1
 
-            if not chunk_data: continue
-
-            logger.debug(f"Preparing Parquet chunk {chunk_num}/{num_chunks} ({len(chunk_data)} rows)")
-            # Keep chunk processing within its own try-except to handle chunk-specific errors
             try:
-                df_chunk = pd.DataFrame(chunk_data)
-                table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+                 df_chunk = pd.DataFrame(chunk_data)
+                 table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+                 # 'del' works on object
+                 del df_chunk; df_chunk = None
+                 gc.collect()
 
-                if schema is None:
-                    schema = table.schema
-                    # Initialize ParquetWriter here, only if data exists
-                    pq_writer = pq.ParquetWriter(parquet_file, schema, compression='snappy')
+                 if writer is None:
+                     schema = table.schema
+                     logger.info(f"Inferred schema for {os.path.basename(output_file)}: {schema}")
+                     writer = pq.ParquetWriter(output_file, schema, compression='snappy')
 
-                # Schema check (optional, can be removed if causing issues and data is uniform)
-                if table.schema != schema:
-                     logger.warning(f"Schema mismatch in Parquet chunk {chunk_num}. Casting to expected schema.")
-                     try:
-                         table = table.cast(schema, safe=False) # Cast to the writer's schema
-                     except Exception as cast_err:
-                         logger.error(f"Failed to cast table schema for chunk {chunk_num}: {cast_err}. Skipping chunk.")
-                         # Clean up chunk-specific resources before skipping
-                         del df_chunk
-                         del table
-                         gc.collect()
-                         continue # Skip to the next chunk
+                 if table.schema != schema:
+                     logger.warning(f"Schema mismatch chunk {chunk_num}. Casting.")
+                     table = table.cast(schema, safe=False)
 
-                # Write the table (potentially casted)
-                if pq_writer: # Ensure writer was initialized
-                    pq_writer.write_table(table)
-                    logger.info(f"Written Parquet chunk {chunk_num}/{num_chunks}")
-                else:
-                    # This should not happen if schema was derived, but safety check
-                    logger.error(f"Parquet writer not initialized when trying to write chunk {chunk_num}. Skipping.")
-
-
+                 writer.write_table(table)
             except Exception as chunk_err:
-                 logger.error(f"Error processing or writing Parquet chunk {chunk_num}: {chunk_err}")
-                 # Continue to the next chunk? Or re-raise to abort? Let's continue.
+                 logger.error(f"Error writing chunk {chunk_num} to {os.path.basename(output_file)}: {chunk_err}")
             finally:
-                # Clean up chunk-specific resources immediately
-                if 'df_chunk' in locals(): del df_chunk
-                if 'table' in locals(): del table
-                gc.collect()
+                 # 'del' works on object
+                 if table is not None: del table; table = None
+                 gc.collect()
 
-        # Close the writer *after* the loop if it was initialized
-        if pq_writer:
-             logger.info("Closing Parquet writer...")
-             pq_writer.close()
-             logger.info(f"Parquet file '{parquet_file}' successfully written (or attempted).")
-        else:
-             # This could happen if the input `data` was empty or all chunks failed before schema inference
-             logger.warning("Parquet writer was never initialized (likely no valid data chunks). Parquet file may not exist or be empty.")
-
-    except MemoryError:
-        # Error Handling: Keep logging, remove the faulty .closed check
-        logger.error("MemoryError during export process.")
-        # No need to explicitly close pq_writer here, finally block will handle it.
-        gc.collect()
     except Exception as e:
-        # Error Handling: Keep logging, remove the faulty .closed check
-        logger.error(f"Unexpected error during export: {e}", exc_info=True) # Log traceback for unexpected errors
-        # No need to explicitly close pq_writer here, finally block will handle it.
+        logger.error(f"Failed to export {output_file}: {e}", exc_info=True)
     finally:
-         # Final Cleanup Attempt for Parquet Writer
-         if pq_writer: # Check if the writer object exists
-             logger.info("Ensuring Parquet writer is closed in finally block...")
-             try:
-                 pq_writer.close()
-             except Exception as close_err:
-                 # Log if closing itself fails, but don't crash the script
-                 logger.warning(f"Error encountered while closing Parquet writer in finally block: {close_err}")
-         logger.info("Export process finished.")
+        # Check if writer object exists before closing
+        if writer is not None:
+             try: writer.close()
+             except Exception as close_err: logger.warning(f"Error closing writer: {close_err}")
+        logger.info(f"Finished export attempt for {output_file}")
 
-# --- Main Execution Block ---
 
-def main():
-    """Main entry point for the script with enhanced error handling and progress tracking."""
-    cdef:
-        str platform_type, input_folder, sources_txt, output_base
-        double available_memory_gb
-        cython.int num_workers = 0  # 0 means auto-calculate
-        list processed_data = []
-        object df_preview
-        bint success = False  # Track overall success
-        double start_time = time.time()
+def export_datasets(train_data: List[Dict[str, Any]], eval_data: List[Dict[str, Any]], output_basename: str):
+    logger.info("--- Exporting Datasets ---")
+    if train_data: _export_single_parquet(train_data, f"{output_basename}_train.parquet")
+    if eval_data: _export_single_parquet(eval_data, f"{output_basename}_eval.parquet")
 
-    try:
-        # 1. Configure environment and log system info
-        configure_multiprocessing()
-        platform_type = get_platform_info()
-        available_memory_gb = get_available_memory()
-        
-        logger.info("="*50)
-        logger.info("Starting Data Processing Pipeline")
-        logger.info("="*50)
-        
-        # Enhanced system information logging
-        logger.info("System Information:")
-        logger.info(f"- Platform: {platform_type}")
-        logger.info(f"- Python Version: {sys.version.split()[0]}")
-        logger.info(f"- Pandas Version: {pd.__version__}")
-        logger.info(f"- PyArrow Version: {pa.__version__}")
-        logger.info(f"- Available Memory: {available_memory_gb:.1f} GB")
-        logger.info(f"- CPU Count (Logical): {psutil.cpu_count(logical=True)}")
-        logger.info(f"- Multiprocessing Start Method: {multiprocessing.get_start_method(allow_none=True)}")
-        logger.info("-"*50)
 
-        # 2. Define paths with proper validation
-        input_folder = os.path.abspath(os.getenv('INPUT_FOLDER', 'corpora'))
-        sources_txt = os.path.abspath(os.getenv('SOURCES_FILE', 'sources.txt'))
-        output_base = os.path.abspath(os.getenv('OUTPUT_BASENAME', 'output'))
-        
-        logger.info(f"Input Folder: {input_folder}")
-        logger.info(f"Sources File: {sources_txt}")
-        logger.info(f"Output Base: {output_base}")
-        
-        # Validate input paths
-        if not os.path.isdir(input_folder):
-            logger.error(f"Input folder not found: {input_folder}")
-            return 1
-            
-        if not os.path.isfile(sources_txt):
-            logger.error(f"Sources file not found: {sources_txt}")
-            return 1
-            
-        # 3. Configure worker count
-        num_workers = _configure_worker_count()
-        
-        # 4. Process data with proper progress tracking
-        logger.info("-"*50)
-        logger.info("Starting data processing...")
-        
-        # Monitor memory usage during processing
-        mem_before_processing = get_available_memory()
-        processed_data = process_data(input_folder, sources_txt, num_workers)
-        mem_after_processing = get_available_memory()
-        mem_used = mem_before_processing - mem_after_processing
-        
-        logger.info(f"Processing completed. Memory used: {mem_used:.2f} GB")
-        
-        # 5. Export results if available
-        if processed_data:
-            logger.info(f"Exporting {len(processed_data)} records...")
-            export_to_parquet_and_excel(processed_data, output_base)
-            
-            # Preview output file
-            _preview_output(f"{output_base}.parquet")
-            success = True
-        else:
-            logger.warning("No data to export. Processing may have failed.")
-            
-        # Report overall execution time
-        elapsed_time = time.time() - start_time
-        logger.info(f"Total execution time: {elapsed_time:.2f} seconds")
-        logger.info("="*50)
-        
-        return 0 if success else 1
-        
-    except KeyboardInterrupt:
-        logger.info("Process interrupted by user (KeyboardInterrupt)")
-        return 130  # Standard exit code for SIGINT
-    except MemoryError:
-        logger.critical("Critical memory error occurred. Process may be unstable.")
-        return 137  # Out of memory error code
-    except Exception as e:
-        logger.critical(f"Unhandled exception: {type(e).__name__} - {e}", exc_info=True)
-        return 1
+# --- Main Execution ---
 
-def _configure_worker_count() -> int:
-    """Configure and validate worker count from environment or system resources."""
-    try:
-        env_workers = os.getenv('NUM_WORKERS')
-        if env_workers:
-            num_workers = int(env_workers)
-            logger.info(f"Using {num_workers} workers from environment variable")
-        else:
-            # Auto-calculate workers based on system resources
-            _, num_workers = calculate_processing_parameters(100000, "items")
-            logger.info(f"Auto-configured {num_workers} workers based on system resources")
-            
-        # Validate worker count (at least 1, at most CPU count)
-        num_workers = max(1, min(num_workers, psutil.cpu_count(logical=True)))
-        return num_workers
-    except ValueError:
-        logger.warning(f"Invalid NUM_WORKERS value: {os.getenv('NUM_WORKERS')}. Using auto-configuration.")
-        _, num_workers = calculate_processing_parameters(100000, "items")
-        return num_workers
+def _get_validated_path(env_var: str, default: str, check_dir: bool = False) -> str:
+    path = os.path.abspath(os.getenv(env_var, default))
+    exists = os.path.isdir(path) if check_dir else os.path.isfile(path)
+    if not exists:
+        file_type = "directory" if check_dir else "file"
+        logger.warning(f"{file_type.capitalize()} specified by ${env_var} or default not found: {path}")
+    return path
 
 def _preview_output(output_file: str) -> None:
-    """Preview the first few rows of output file."""
+    """Previews first few rows using Pandas read_parquet and df.head()"""
+    if not os.path.exists(output_file):
+        logger.warning(f"Preview file not found: {output_file}")
+        return
     try:
-        if not os.path.exists(output_file):
-            logger.warning(f"Output file {output_file} not found")
-            return
-            
-        logger.info("Output Preview (First 5 Rows):")
-        df_preview = pd.read_parquet(output_file).head(5)
-        
-        # Format preview for better visibility in logs
-        preview_str = df_preview.to_string()
-        logger.info("\n" + "-"*50 + "\n" + preview_str + "\n" + "-"*50)
+        logger.info(f"--- Output Preview ({os.path.basename(output_file)}, Top {PREVIEW_ROWS}): ---")
+        preview_cols = ['source', 'conversations'] # Adjust columns as needed
+   
+        df_full = pd.read_parquet(output_file, columns=preview_cols)
+        df_preview = df_full.head(PREVIEW_ROWS)
+
+        with pd.option_context('display.max_colwidth', 80, 'display.max_rows', PREVIEW_ROWS + 2, 'display.width', 120):
+            logger.info("\n" + df_preview.to_string())
     except Exception as e:
-        logger.warning(f"Could not preview output: {e}")
+        logger.warning(f"Could not preview {output_file}: {e}")
+
+
+def main():
+    # Declare Cython variables at the top of the function scope
+    cdef:
+        double start_time = time.time()
+        bint success = False
+        int exit_code = 1
+        str input_folder = ""
+        str sources_txt = ""
+        str output_base = ""
+        int num_workers = 0
+        list train_data = []
+        list eval_data = []
+        double duration = 0.0
+        str num_workers_str = "" # For reading env var
+        str item = "" # For loop in finally block
+
+    configure_multiprocessing()
+
+    logger.info("="*50)
+    logger.info(f"Platform: {get_platform_info()}, RAM: {get_available_memory():.1f}GB, CPUs: {psutil.cpu_count(logical=True)}")
+    logger.info("="*50)
+
+    try:
+        input_folder = _get_validated_path('INPUT_FOLDER', 'corpora', check_dir=True)
+        sources_txt = _get_validated_path('SOURCES_FILE', 'sources.txt', check_dir=False)
+        output_base = os.path.abspath(os.getenv('OUTPUT_BASENAME', 'output'))
+
+        logger.info(f"Input Folder : {input_folder}")
+        logger.info(f"Sources File : {sources_txt}")
+        logger.info(f"Output Base  : {output_base}")
+
+        if not os.path.isdir(input_folder): raise FileNotFoundError(f"Input folder not found: {input_folder}")
+        if not os.path.isfile(sources_txt): raise FileNotFoundError(f"Sources file not found: {sources_txt}")
+
+        # Assign Python variable value to Cython variable
+        num_workers_str = os.getenv('NUM_WORKERS', '0')
+        num_workers = int(num_workers_str) if num_workers_str and num_workers_str.isdigit() else 0 # Check not None/empty
+
+
+        train_data, eval_data = process_data(input_folder, sources_txt, num_workers)
+
+        if train_data or eval_data:
+            export_datasets(train_data, eval_data, output_base)
+            if train_data: _preview_output(f"{output_base}_train.parquet")
+            success = True
+            exit_code = 0
+        else:
+            logger.warning("Processing completed but yielded no data.")
+            exit_code = 2
+
+    except FileNotFoundError as e:
+        logger.critical(f"Input path error: {e}")
+        exit_code = 3
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted by user.")
+        exit_code = 130
+    except MemoryError:
+        logger.critical("Critical MemoryError occurred. Aborting.")
+        exit_code = 137
+    except Exception as e:
+        logger.critical(f"Unhandled exception in main: {type(e).__name__} - {e}", exc_info=True)
+        exit_code = 1
+    finally:
+        duration = time.time() - start_time
+        status = "Success" if success else ("Failed" if exit_code != 2 else "Completed (No Data)")
+        logger.info("="*50)
+        logger.info(f"Run Status: {status}, Total Time: {duration:.2f}s")
+        logger.info("="*50)
+        # Final temp dir cleanup attempt
+        # Use standard Python loop
+        for item in os.listdir('.'):
+             if item.startswith(TEMP_DIR_BASE) and os.path.isdir(item):
+                 _cleanup_temp_dir(item)
+
+    return exit_code
+
 
 if __name__ == "__main__":
-    # Crucial for multiprocessing, especially on Windows/macOS with 'spawn'
-    # configure_multiprocessing() is called inside main() now to log settings first.
-    main()
+    sys.exit(main())
