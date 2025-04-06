@@ -83,8 +83,8 @@ _RE_CLEANUP = {
      # --- Rules for spaces INSIDE quotes and parentheses ---
     re.compile(r'\(\s+'): '(', # Remove space(s) after (
     re.compile(r'\s+\)'): ')', # Remove space(s) before )
-    re.compile(r'"\s+'): '"', # Remove space(s) after "
-    re.compile(r"\s+\""): '"', # Remove space(s) before "
+    #re.compile(r'"\s+'): '"', # Remove space(s) after "
+    #re.compile(r"\s+\""): '"', # Remove space(s) before "
     re.compile(r"'\s+"): "'", # Remove space(s) after '
     re.compile(r"\s+'"): "'", # Remove space(s) before '
     # Note: The rule re.compile(r" '"): "'" might be redundant now but harmless
