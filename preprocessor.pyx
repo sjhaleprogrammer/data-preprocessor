@@ -59,7 +59,7 @@ DTYPES_CONTENT: Dict[str, Any] = {
 }
 DTYPES_SOURCES: Dict[str, Any] = {
     'id': str, 'year': str, 'type': 'category',
-    'pages': str, 'source': str, 'title': str
+    'subgenre_id': str, 'source': str, 'title': str
 }
 DTYPES_MERGED: Dict[str, Any] = {**DTYPES_CONTENT, **DTYPES_SOURCES}
 
@@ -108,17 +108,38 @@ def get_available_memory() -> cython.double:
     except Exception: return DEFAULT_AVAILABLE_MEMORY_GB
 
 def configure_multiprocessing() -> None:
+    """Sets the multiprocessing start method based on platform."""
     platform_type: str = get_platform_info()
-    desired_method: str = 'fork' if platform_type in ["Windows", "WSL"] or (platform_type == "MacOS" and sys.version_info >= (3, 8)) else 'fork'
+    # Use 'fork' on Unix-like systems (Linux, macOS, WSL) as requested.
+    # 'spawn' is required on Windows.
+    if platform_type in ["Linux", "WSL", "Darwin"]: # Darwin is macOS
+        desired_method: str = 'fork'
+    elif platform_type == "Windows":
+         desired_method: str = 'spawn'
+    else:
+        logger.warning(f"Unknown platform '{platform_type}', defaulting to 'spawn' start method.")
+        desired_method: str = 'spawn'
+
     try:
         current_method = multiprocessing.get_start_method(allow_none=True)
-        if current_method != desired_method:
-             multiprocessing.set_start_method(desired_method, force=True)
-             logger.info(f"Set multiprocessing start method to '{desired_method}'")
-        if platform_type == "Windows": multiprocessing.freeze_support()
+        if current_method is None or current_method != desired_method:
+            # Force setting only if changing method OR if current is None
+            force_set = current_method is not None and current_method != desired_method
+            multiprocessing.set_start_method(desired_method, force=force_set)
+            logger.info(f"Set multiprocessing start method to '{desired_method}' (Platform: {platform_type})")
+        else:
+             logger.info(f"Multiprocessing start method already set to '{current_method}'")
+
+        # freeze_support() is crucial for creating executables on Windows
+        if platform_type == "Windows" and getattr(sys, 'frozen', False):
+             multiprocessing.freeze_support()
+
+    except ValueError as e: # Catch specific error if method is already set and force=False
+        logger.warning(f"Could not set start method to '{desired_method}' (may be already set?): {e}. Using: {multiprocessing.get_start_method(allow_none=True)}")
     except Exception as e:
-        logger.error(f"Failed config multiprocessing '{desired_method}': {e}. Using default: {multiprocessing.get_start_method(allow_none=True)}")
-        if platform_type == "Windows": multiprocessing.freeze_support()
+        logger.error(f"Failed configuring multiprocessing '{desired_method}': {e}. Using method: {multiprocessing.get_start_method(allow_none=True)}")
+        if platform_type == "Windows" and getattr(sys, 'frozen', False):
+             multiprocessing.freeze_support() # Still attempt freeze_support
 
 @cython.cdivision(True)
 def calculate_processing_parameters(total_items: cython.int, item_type: str = "lines") -> Tuple[cython.int, cython.int]:
@@ -225,7 +246,7 @@ def parse_sources_file(sources_file: str) -> pd.DataFrame:
         parts = line.split(maxsplit=5)
         if len(parts) == 6:
             sources_data.append({'id': parts[0], 'year': parts[1], 'type': parts[2],
-                                 'pages': parts[3], 'source': parts[4], 'title': parts[5]})
+                                 'subgenre_id': parts[3], 'source': parts[4], 'title': parts[5]})
         else:
             logger.warning(f"Skipping malformed line in sources: '{line[:80]}...'")
 
