@@ -39,7 +39,7 @@ warnings.filterwarnings('ignore', category=MarkupResemblesLocatorWarning)
 
 # --- Constants ---
 ENCODINGS: List[str] = ['utf-8', 'latin-1', 'cp1252']
-MEMORY_SAFETY_FACTOR: float = 0.8
+MEMORY_SAFETY_FACTOR: float = 0.9
 MIN_MEMORY_PER_WORKER_GB: float = 0.4
 DEFAULT_AVAILABLE_MEMORY_GB: float = 4.0
 MIN_BATCH_SIZE: cython.int = 200
@@ -47,7 +47,7 @@ MAX_BATCH_SIZE: cython.int = 15000
 FILE_PROCESSING_CHUNK_SIZE: cython.int = 100
 BATCH_PROCESSING_CHUNK_SIZE: cython.int = 100
 EXPORT_CHUNK_SIZE: cython.int = 100000
-TRAIN_SPLIT_RATIO: float = 1
+TRAIN_SPLIT_RATIO: float = 0.8
 RANDOM_SEED: cython.int = 42
 TEMP_DIR_BASE: str = "temp_parser_batches"
 PREVIEW_ROWS: cython.int = 5 # Number of rows to show in preview
@@ -104,8 +104,29 @@ def get_platform_info() -> str:
 
 @cython.cfunc
 def get_available_memory() -> cython.double:
-    try: return max(0.1, psutil.virtual_memory().available / (1024.0 ** 3))
-    except Exception: return DEFAULT_AVAILABLE_MEMORY_GB
+    """
+    Returns available memory in GB, including both physical RAM and swap space.
+    """
+    try:
+        # Get available physical memory
+        available_physical = psutil.virtual_memory().available
+        
+        # Get swap information
+        swap = psutil.swap_memory()
+        available_swap = swap.free
+        
+        # Total available memory is physical + swap
+        total_available = available_physical + available_swap
+        
+        # Convert to GB
+        total_available_gb = max(0.1, total_available / (1024.0 ** 3))
+        
+        logger.info(f"Memory: Physical={available_physical/(1024**3):.2f}GB, Swap={available_swap/(1024**3):.2f}GB, Total={total_available_gb:.2f}GB")
+        
+        return total_available_gb
+    except Exception as e:
+        logger.warning(f"Error getting memory info: {e}. Using default: {DEFAULT_AVAILABLE_MEMORY_GB}GB")
+        return DEFAULT_AVAILABLE_MEMORY_GB
 
 def configure_multiprocessing() -> None:
     """Sets the multiprocessing start method based on platform."""
@@ -148,8 +169,7 @@ def calculate_processing_parameters(total_items: cython.int, item_type: str = "l
     est_mem_kb = 15 if item_type == "lines" else 512
     max_mem_batch_gb = available_memory_gb * 0.10
     calc_batch = <cython.int>((max_mem_batch_gb * 1024**2) / est_mem_kb) if est_mem_kb > 0 else MAX_BATCH_SIZE
-    # batch_size = max(MIN_BATCH_SIZE, min(calc_batch, MAX_BATCH_SIZE))
-    batch_size = 1000
+    batch_size = max(MIN_BATCH_SIZE, min(calc_batch, MAX_BATCH_SIZE))
 
     mem_workers = max(1, <cython.int>((available_memory_gb * MEMORY_SAFETY_FACTOR) / MIN_MEMORY_PER_WORKER_GB))
     cpu_workers = max(1, logical_cpu_count - 1)
@@ -578,10 +598,11 @@ def parse_content_lines_parallel(line_dicts: List[Dict[str, Any]], batch_size: c
     if total_lines == 0: return pd.DataFrame(columns=DTYPES_CONTENT.keys()).astype(DTYPES_CONTENT)
 
     estimated_mem_needed_gb = (total_lines * 15) / (1024**2)
-    if estimated_mem_needed_gb > available_memory_gb_start * 0.7:
+    if estimated_mem_needed_gb > available_memory_gb_start * MEMORY_SAFETY_FACTOR:
         logger.warning(f"High estimated memory need. Switching to sequential parsing.")
         return parse_content_lines_sequential(line_dicts, batch_size)
-
+    logger.info(f"Memory check passed: need {estimated_mem_needed_gb:.2f}GB of {available_memory_gb_start:.2f}GB (includes swap)")
+    
     logger.info(f"Starting parallel parsing ({total_lines} lines, Batch={batch_size}, Workers={num_workers})")
     temp_dir = _get_temp_dir("par")
 
@@ -623,7 +644,7 @@ def parse_content_lines_parallel(line_dicts: List[Dict[str, Any]], batch_size: c
             mem_after_chunk = get_available_memory()
             logger.info(f"Finished chunk {batch_chunk_idx + 1}. Rows: {len(all_rows)}. Available RAM: {mem_after_chunk:.1f} GB")
 
-            low_mem_threshold = max(0.8, available_memory_gb_start * 0.15)
+            low_mem_threshold = max(0.4, available_memory_gb_start * 0.10)
             if mem_after_chunk < low_mem_threshold:
                 logger.warning(f"Low memory detected ({mem_after_chunk:.1f} GB). Falling back to sequential for remaining.")
                 temp_fallback_file = None
@@ -920,21 +941,21 @@ def _export_single_parquet(data: List[Dict[str, Any]], output_file: str):
     logger.info(f"Exporting {total_rows} records to {output_file}...")
 
     cdef:
-        # Use object for Schema, Writer, DataFrame, Table
         object schema = None
         object writer = None
-        cython.int i = 0 # Initialize
-        cython.int chunk_num = 0 # Initialize
-        cython.int start_idx = 0 # Initialize
-        cython.int end_idx = 0 # Initialize
-        cython.int num_chunks = 0 # Initialize
+        cython.int i = 0
+        cython.int chunk_num = 0
+        cython.int start_idx = 0
+        cython.int end_idx = 0
+        cython.int num_chunks = 0
         list chunk_data = []
         object df_chunk = None
         object table = None
+        double available_mem = 0.0
 
     try:
         # Use smaller chunks for less memory usage
-        chunk_size = min(EXPORT_CHUNK_SIZE, 10000)  # Smaller chunk size
+        chunk_size = min(EXPORT_CHUNK_SIZE, 5000)  # Even smaller chunk size for exports
         num_chunks = (total_rows + chunk_size - 1) // chunk_size
         
         for i in range(num_chunks):
@@ -946,42 +967,102 @@ def _export_single_parquet(data: List[Dict[str, Any]], output_file: str):
             logger.info(f"Exporting chunk {chunk_num}/{num_chunks} ({len(chunk_data)} records)")
 
             try:
+                # Create DataFrame from chunk
                 df_chunk = pd.DataFrame(chunk_data)
+                
+                # Check available memory before converting to Arrow Table
+                available_mem = get_available_memory()
+                logger.info(f"Memory before Arrow conversion: {available_mem:.2f}GB")
+                
+                # If memory is getting low, try to free up some
+                if available_mem < 1.0:  # If less than 1GB available
+                    logger.warning("Low memory before Arrow conversion, forcing garbage collection")
+                    del chunk_data
+                    gc.collect()
+                
+                # Convert to Arrow Table with memory-optimized approach
                 table = pa.Table.from_pandas(df_chunk, preserve_index=False)
-                # 'del' works on object
-                del df_chunk; df_chunk = None
-                del chunk_data; chunk_data = []  # Clear the chunk data immediately
+                
+                # Clean up DataFrame immediately after converting to Arrow
+                del df_chunk
+                df_chunk = None
+                del chunk_data
+                chunk_data = []
                 gc.collect()
 
+                # Initialize writer with schema from first chunk
                 if writer is None:
                     schema = table.schema
                     logger.info(f"Inferred schema for {os.path.basename(output_file)}: {schema}")
                     writer = pq.ParquetWriter(output_file, schema, compression='snappy')
 
+                # Ensure schema compatibility
                 if table.schema != schema:
                     logger.warning(f"Schema mismatch chunk {chunk_num}. Casting.")
                     table = table.cast(schema, safe=False)
 
+                # Write table and clean up
                 writer.write_table(table)
-                del table; table = None
+                del table
+                table = None
                 gc.collect()
+                
+                # Log memory usage after each chunk
+                logger.info(f"Memory after chunk {chunk_num}: {get_available_memory():.2f}GB")
+                
             except Exception as chunk_err:
                 logger.error(f"Error writing chunk {chunk_num} to {os.path.basename(output_file)}: {chunk_err}")
             finally:
-                # Clear any remaining objects
-                if 'table' in locals() and table is not None: del table; table = None
-                if 'df_chunk' in locals() and df_chunk is not None: del df_chunk; df_chunk = None
-                if 'chunk_data' in locals() and chunk_data: del chunk_data; chunk_data = []
+                # Ensure cleanup
+                if 'table' in locals() and table is not None: 
+                    del table
+                    table = None
+                if 'df_chunk' in locals() and df_chunk is not None: 
+                    del df_chunk
+                    df_chunk = None
+                if 'chunk_data' in locals() and chunk_data: 
+                    del chunk_data
+                    chunk_data = []
                 gc.collect()
 
     except Exception as e:
         logger.error(f"Failed to export {output_file}: {e}", exc_info=True)
     finally:
-        # Check if writer object exists before closing
+        # Close writer and complete export
         if writer is not None:
-            try: writer.close()
-            except Exception as close_err: logger.warning(f"Error closing writer: {close_err}")
-        logger.info(f"Finished export attempt for {output_file}")
+            try: 
+                writer.close()
+                logger.info(f"Successfully closed writer for {os.path.basename(output_file)}")
+            except Exception as close_err: 
+                logger.warning(f"Error closing writer: {close_err}")
+        
+        # Final garbage collection
+        gc.collect()
+        logger.info(f"Finished export for {output_file}")
+
+def _check_memory(operation_name: str, warning_threshold_gb: float = 1.0) -> None:
+    """Monitor memory during critical operations and log warnings if low"""
+    try:
+        available_gb = get_available_memory()
+        
+        # Get current process memory usage
+        process = psutil.Process(os.getpid())
+        process_mem_gb = process.memory_info().rss / (1024**3)
+        
+        logger.info(f"Memory check ({operation_name}): Available={available_gb:.2f}GB, Process={process_mem_gb:.2f}GB")
+        
+        if available_gb < warning_threshold_gb:
+            logger.warning(f"LOW MEMORY ALERT during {operation_name}: Only {available_gb:.2f}GB available!")
+            # Force garbage collection
+            collected = gc.collect()
+            logger.info(f"Forced garbage collection: {collected} objects collected")
+            
+            # Log new memory state after collection
+            new_available_gb = get_available_memory()
+            logger.info(f"Memory after GC: {new_available_gb:.2f}GB (Recovered: {new_available_gb - available_gb:.2f}GB)")
+            
+    except Exception as e:
+        logger.warning(f"Error in memory check: {e}")
 
 
 def export_datasets(train_data: List[Dict[str, Any]], eval_data: List[Dict[str, Any]], output_basename: str):
@@ -1001,21 +1082,89 @@ def _get_validated_path(env_var: str, default: str, check_dir: bool = False) -> 
     return path
 
 def _preview_output(output_file: str) -> None:
-    """Previews first few rows using Pandas read_parquet and df.head()"""
+    """Previews first few rows using PyArrow to manage memory better"""
     if not os.path.exists(output_file):
         logger.warning(f"Preview file not found: {output_file}")
         return
+        
+    # Declare all variables at top level for Cython compatibility
+    cdef:
+        object table = None
+        object preview_table = None
+        object df_preview = None
+        object parquet_file = None
+        list preview_cols = ['source', 'conversations']
+        int preview_rows = 0
+        
     try:
         logger.info(f"--- Output Preview ({os.path.basename(output_file)}, Top {PREVIEW_ROWS}): ---")
-        preview_cols = ['source', 'conversations'] # Adjust columns as needed
-   
-        df_full = pd.read_parquet(output_file, columns=preview_cols)
-        df_preview = df_full.head(PREVIEW_ROWS)
+        
+        # Use PyArrow to read only the first few rows instead of loading the entire file
+        try:
+            # First try with PyArrow's dataset API which is more memory efficient
+            table = pq.read_table(
+                output_file, 
+                columns=preview_cols,
+                memory_map=True  # Use memory mapping to reduce memory footprint
+            )
+            
+            # Only take the first few rows
+            preview_table = table.slice(0, PREVIEW_ROWS)
+            
+            # Convert to pandas for display, limited to just a few rows
+            df_preview = preview_table.to_pandas()
+            
+            # Clean up the Arrow objects immediately to free memory
+            preview_table = None
+            table = None
+            gc.collect()
+            
+        except Exception as arrow_err:
+            logger.warning(f"PyArrow optimized preview failed: {arrow_err}, trying fallback method")
+            
+            # Fallback method: Use a file handle to read specific parts of the file
+            parquet_file = pq.ParquetFile(output_file)
+            
+            # Only read the first row group (or first few rows if possible)
+            preview_rows = min(PREVIEW_ROWS, parquet_file.metadata.num_rows)
+            df_preview = next(parquet_file.iter_batches(batch_size=preview_rows)).to_pandas()
+            
+            # Limit to just the preview columns if they exist
+            if all(col in df_preview.columns for col in preview_cols):
+                df_preview = df_preview[preview_cols]
+                
+            # Clean up
+            parquet_file = None
+            gc.collect()
 
-        with pd.option_context('display.max_colwidth', 80, 'display.max_rows', PREVIEW_ROWS + 2, 'display.width', 120):
-            logger.info("\n" + df_preview.to_string())
+        # Format output with limited width to avoid terminal overflow
+        with pd.option_context('display.max_colwidth', 60, 'display.max_rows', PREVIEW_ROWS + 2, 'display.width', 100):
+            # For the 'conversations' column, which is likely complex, simplify the display
+            if 'conversations' in df_preview.columns:
+                # Create a new simplified column for display to avoid modifying in place
+                # which can cause issues with Cython scoping
+                display_df = df_preview.copy()
+                
+                # Simplify each conversation entry for display
+                for i in range(len(display_df)):
+                    if isinstance(display_df.loc[i, 'conversations'], list):
+                        display_df.loc[i, 'conversations'] = f"[{len(display_df.loc[i, 'conversations'])} messages]"
+                    elif display_df.loc[i, 'conversations'] is not None:
+                        display_df.loc[i, 'conversations'] = str(display_df.loc[i, 'conversations'])[:50]
+                
+                logger.info("\n" + display_df.to_string())
+                display_df = None
+            else:
+                logger.info("\n" + df_preview.to_string())
+            
+        # Final cleanup - Without using del in a nested scope
+        df_preview = None
+        gc.collect()
+        
     except Exception as e:
-        logger.warning(f"Could not preview {output_file}: {e}")
+        logger.error(f"Could not preview {output_file}: {e}")
+        # Force garbage collection to clean up any partial objects
+        gc.collect()
 
 
 def main():
