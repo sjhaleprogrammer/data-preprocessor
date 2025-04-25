@@ -87,6 +87,9 @@ _RE_CLEANUP = {
     #re.compile(r"\s+\""): '"', # Remove space(s) before "
     re.compile(r"'\s+"): "'", # Remove space(s) after '
     re.compile(r"\s+'"): "'", # Remove space(s) before '
+    re.compile(r"\'"): "'", # Remove slash(s) before '
+    re.compile(r"&;"): "", # Remove html bullshit '
+    re.compile(r'\*\*[^\s]*?(?:;[^\s]*?)+'): "", # Remove TOOLONG bullshit 'r'\*\*[^\s]*?(?:;[^\s]*?)+'
     # Note: The rule re.compile(r" '"): "'" might be redundant now but harmless
 } 
 
