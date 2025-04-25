@@ -148,7 +148,8 @@ def calculate_processing_parameters(total_items: cython.int, item_type: str = "l
     est_mem_kb = 15 if item_type == "lines" else 512
     max_mem_batch_gb = available_memory_gb * 0.10
     calc_batch = <cython.int>((max_mem_batch_gb * 1024**2) / est_mem_kb) if est_mem_kb > 0 else MAX_BATCH_SIZE
-    batch_size = max(MIN_BATCH_SIZE, min(calc_batch, MAX_BATCH_SIZE))
+    # batch_size = max(MIN_BATCH_SIZE, min(calc_batch, MAX_BATCH_SIZE))
+    batch_size = 1000
 
     mem_workers = max(1, <cython.int>((available_memory_gb * MEMORY_SAFETY_FACTOR) / MIN_MEMORY_PER_WORKER_GB))
     cpu_workers = max(1, logical_cpu_count - 1)
@@ -419,44 +420,72 @@ def _save_temp_parquet(df: pd.DataFrame, temp_file: str) -> bool:
         return True
     except Exception as e: logger.error(f"Failed to save {temp_file}: {e}"); return False
 
+
 def _combine_temp_parquets(temp_files: List[str], dtypes: Dict[str, Any]) -> pd.DataFrame:
-    if not temp_files: return pd.DataFrame(columns=dtypes.keys()).astype(dtypes)
+    if not temp_files: 
+        return pd.DataFrame(columns=dtypes.keys()).astype(dtypes)
+    
     logger.info(f"Combining {len(temp_files)} temporary Parquet files...")
-    cdef list tables = []
     cdef list final_cols = list(dtypes.keys())
-    cdef str f
-    # Use object for table types
-    cdef object table_chunk
-    cdef object combined_table
-    cdef object combined_df # Keep as object for DataFrame reference
-
-    for f in temp_files:
-        try:
-            table_chunk = pq.read_table(f, columns=final_cols)
-            tables.append(table_chunk)
-        except Exception as e: logger.warning(f"Skipping corrupt/missing temp file {f}: {e}")
-
-    if not tables: return pd.DataFrame(columns=final_cols).astype(dtypes)
-
+    cdef str temp_dir = None
+    cdef int batch_size = 5  # Process 5 files at a time - smaller batch for less memory use
+    cdef int total_batches = (len(temp_files) + batch_size - 1) // batch_size
+    cdef object final_df = pd.DataFrame(columns=final_cols).astype(dtypes)
+    
     try:
-        logger.info("Concatenating Arrow tables...")
-        combined_table = pa.concat_tables(tables)
-        del tables; gc.collect()
-        logger.info("Converting to Pandas DataFrame...")
-        combined_df = combined_table.to_pandas(self_destruct=True, zero_copy_only=False)
-        del combined_table; gc.collect()
-        logger.info("Applying final dtypes...")
-        # Using combined_df.astype directly is generally fine here
-        combined_df = combined_df.astype(dtypes, errors='ignore')
-        # Use .loc for single-column modification after initial cast
-        if 'type' in combined_df.columns and combined_df['type'].dtype == 'object':
-             # Use .loc to modify the specific column 'type'
-             combined_df.loc[:, 'type'] = combined_df['type'].astype('category')
-        logger.info(f"Combined {len(combined_df)} rows. RAM: {combined_df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
-        # Return the Python object; type hint in signature informs Python side
-        return combined_df
+        # Process files in batches to avoid memory overload
+        for batch_num in range(1, total_batches + 1):
+            start_idx = (batch_num - 1) * batch_size
+            end_idx = min(start_idx + batch_size, len(temp_files))
+            batch_files = temp_files[start_idx:end_idx]
+            
+            logger.info(f"Processing batch {batch_num}/{total_batches} with {len(batch_files)} files")
+            
+            # Process this batch into a dataframe directly
+            batch_dfs = []
+            for file_path in batch_files:
+                try:
+                    # Read just a single file into pandas
+                    file_df = pq.read_table(file_path, columns=final_cols).to_pandas()
+                    batch_dfs.append(file_df)
+                    del file_df
+                except Exception as e:
+                    logger.warning(f"Error reading file {file_path}: {e}")
+            
+            # Combine this batch if we have any dataframes
+            if batch_dfs:
+                # Concatenate dataframes in this batch
+                batch_df = pd.concat(batch_dfs, ignore_index=True)
+                
+                # Append to the final dataframe
+                final_df = pd.concat([final_df, batch_df], ignore_index=True)
+                
+                # Clean up
+                del batch_df
+                del batch_dfs
+                gc.collect()
+                
+            logger.info(f"Progress: {batch_num}/{total_batches} batches processed")
+        
+        # Apply final dtypes at the end
+        if not final_df.empty:
+            logger.info("Applying final dtypes...")
+            final_df = final_df.astype(dtypes, errors='ignore')
+            
+            # Special handling for categorical columns
+            if 'type' in final_df.columns and final_df['type'].dtype == 'object':
+                final_df.loc[:, 'type'] = final_df['type'].astype('category')
+                
+            logger.info(f"Combined {len(final_df)} rows. RAM: {final_df.memory_usage(deep=True).sum() / 1e6:.2f} MB")
+        
+        return final_df
+            
     except Exception as e:
         logger.error(f"Error combining temp files: {e}")
+        return pd.DataFrame(columns=final_cols).astype(dtypes)
+        
+    except Exception as e:
+        logger.error(f"Error combining temp files with Arrow Dataset: {e}")
         return pd.DataFrame(columns=final_cols).astype(dtypes)
 
 
@@ -724,27 +753,74 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
         return []
 
     logger.info(f"Formatting {len(merged_df)} rows for validation structure...")
+    cdef int chunk_size = 50000  # Process in smaller chunks
+    cdef int total_chunks = (len(merged_df) + chunk_size - 1) // chunk_size
     cdef list validation_format = []
-    cdef object row # Use object for itertuples result
+    cdef list chunk_format = []
+    cdef object chunk_df = None
+    cdef int i, start_idx, end_idx
+    cdef object row  # Use object for itertuples result
     cdef str content_val, source_val, country_val, title_val, gpt_response
     cdef list conversation
 
     try:
-        # row will be a Python namedtuple object
-        for row in merged_df.itertuples(index=False):
-            content_val = str(getattr(row, 'content', ''))
-            source_val = str(getattr(row, 'source', 'unknown_source'))
-            country_val = str(getattr(row, 'country', 'unknown_country'))
-            title_val = str(getattr(row, 'title', 'unknown_title')).strip()
-
-            gpt_response = (f"The sample you provided appears to come from the country {country_val}. "
-                            f"Task: Identify the dialect of the provided text, give additional context about it, and learn the dialect.")
-            conversation = [{"from": "human", "value": "Given the following example text, identify the dialect of the speaker: " + content_val },
-                            {"from": "gpt", "value": gpt_response}]
-            validation_format.append({"conversations": conversation, "source": source_val, "score": 0})
-        logger.info(f"Formatted {len(validation_format)} records.")
+        for i in range(total_chunks):
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, len(merged_df))
+            logger.info(f"Formatting chunk {i+1}/{total_chunks} (rows {start_idx}-{end_idx})")
+            
+            # Get chunk of the dataframe
+            chunk_df = merged_df.iloc[start_idx:end_idx]
+            chunk_format = []
+            
+            # Process each row in the chunk
+            for row in chunk_df.itertuples(index=False):
+                content_val = str(getattr(row, 'content', ''))
+                
+                # Start building gpt_response
+                gpt_response = "The sample you provided "
+                
+                # Add country info if available
+                if hasattr(row, 'country') and getattr(row, 'country') and str(getattr(row, 'country')) != 'nan':
+                    country_val = str(getattr(row, 'country'))
+                    gpt_response += f"appears to come from {country_val}"
+                
+                # Add title info if available
+                if hasattr(row, 'title') and getattr(row, 'title') and str(getattr(row, 'title')).strip() != 'nan':
+                    title_val = str(getattr(row, 'title')).strip()
+                    if "come from" in gpt_response:
+                        gpt_response += f" and has the title '{title_val}'"
+                    else:
+                        gpt_response += f"has the title '{title_val}'"
+                
+                # Add source info if available
+                source_val = str(getattr(row, 'source', 'unknown_source'))
+                
+                # Finalize the response with a period if needed
+                if not gpt_response.endswith('.'):
+                    gpt_response += "."
+                
+                # Create conversation structure
+                conversation = [
+                    {"from": "human", "value": "Given the following example text, identify the dialect of the speaker: " + content_val},
+                    {"from": "gpt", "value": gpt_response}
+                ]
+                
+                # Add to chunk results
+                chunk_format.append({"conversations": conversation, "source": source_val, "score": 0})
+            
+            # Append chunk results to main results and free memory
+            validation_format.extend(chunk_format)
+            del chunk_df
+            del chunk_format
+            gc.collect()
+            
+            logger.info(f"Processed {len(validation_format)} records so far")
+            
+        logger.info(f"Formatted {len(validation_format)} records total.")
     except Exception as e:
         logger.error(f"Error during validation formatting: {e}", exc_info=True)
+    
     return validation_format
 
 # --- Main Pipeline ---
@@ -857,45 +933,54 @@ def _export_single_parquet(data: List[Dict[str, Any]], output_file: str):
         object table = None
 
     try:
-        num_chunks = (total_rows + EXPORT_CHUNK_SIZE - 1) // EXPORT_CHUNK_SIZE
+        # Use smaller chunks for less memory usage
+        chunk_size = min(EXPORT_CHUNK_SIZE, 10000)  # Smaller chunk size
+        num_chunks = (total_rows + chunk_size - 1) // chunk_size
+        
         for i in range(num_chunks):
-            start_idx = i * EXPORT_CHUNK_SIZE
-            end_idx = min(start_idx + EXPORT_CHUNK_SIZE, total_rows)
+            start_idx = i * chunk_size
+            end_idx = min(start_idx + chunk_size, total_rows)
             chunk_data = data[start_idx:end_idx]
             if not chunk_data: continue
             chunk_num = i + 1
+            logger.info(f"Exporting chunk {chunk_num}/{num_chunks} ({len(chunk_data)} records)")
 
             try:
-                 df_chunk = pd.DataFrame(chunk_data)
-                 table = pa.Table.from_pandas(df_chunk, preserve_index=False)
-                 # 'del' works on object
-                 del df_chunk; df_chunk = None
-                 gc.collect()
+                df_chunk = pd.DataFrame(chunk_data)
+                table = pa.Table.from_pandas(df_chunk, preserve_index=False)
+                # 'del' works on object
+                del df_chunk; df_chunk = None
+                del chunk_data; chunk_data = []  # Clear the chunk data immediately
+                gc.collect()
 
-                 if writer is None:
-                     schema = table.schema
-                     logger.info(f"Inferred schema for {os.path.basename(output_file)}: {schema}")
-                     writer = pq.ParquetWriter(output_file, schema, compression='snappy')
+                if writer is None:
+                    schema = table.schema
+                    logger.info(f"Inferred schema for {os.path.basename(output_file)}: {schema}")
+                    writer = pq.ParquetWriter(output_file, schema, compression='snappy')
 
-                 if table.schema != schema:
-                     logger.warning(f"Schema mismatch chunk {chunk_num}. Casting.")
-                     table = table.cast(schema, safe=False)
+                if table.schema != schema:
+                    logger.warning(f"Schema mismatch chunk {chunk_num}. Casting.")
+                    table = table.cast(schema, safe=False)
 
-                 writer.write_table(table)
+                writer.write_table(table)
+                del table; table = None
+                gc.collect()
             except Exception as chunk_err:
-                 logger.error(f"Error writing chunk {chunk_num} to {os.path.basename(output_file)}: {chunk_err}")
+                logger.error(f"Error writing chunk {chunk_num} to {os.path.basename(output_file)}: {chunk_err}")
             finally:
-                 # 'del' works on object
-                 if table is not None: del table; table = None
-                 gc.collect()
+                # Clear any remaining objects
+                if 'table' in locals() and table is not None: del table; table = None
+                if 'df_chunk' in locals() and df_chunk is not None: del df_chunk; df_chunk = None
+                if 'chunk_data' in locals() and chunk_data: del chunk_data; chunk_data = []
+                gc.collect()
 
     except Exception as e:
         logger.error(f"Failed to export {output_file}: {e}", exc_info=True)
     finally:
         # Check if writer object exists before closing
         if writer is not None:
-             try: writer.close()
-             except Exception as close_err: logger.warning(f"Error closing writer: {close_err}")
+            try: writer.close()
+            except Exception as close_err: logger.warning(f"Error closing writer: {close_err}")
         logger.info(f"Finished export attempt for {output_file}")
 
 
