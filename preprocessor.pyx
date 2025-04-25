@@ -47,7 +47,7 @@ MAX_BATCH_SIZE: cython.int = 15000
 FILE_PROCESSING_CHUNK_SIZE: cython.int = 100
 BATCH_PROCESSING_CHUNK_SIZE: cython.int = 100
 EXPORT_CHUNK_SIZE: cython.int = 100000
-TRAIN_SPLIT_RATIO: float = 0.8
+TRAIN_SPLIT_RATIO: float = 1
 RANDOM_SEED: cython.int = 42
 TEMP_DIR_BASE: str = "temp_parser_batches"
 PREVIEW_ROWS: cython.int = 5 # Number of rows to show in preview
@@ -58,8 +58,8 @@ DTYPES_CONTENT: Dict[str, Any] = {
     'file_order': np.uint32, 'line_num': np.uint32, 'sequence': np.int64
 }
 DTYPES_SOURCES: Dict[str, Any] = {
-    'id': str, 'year': str, 'type': 'category',
-    'subgenre_id': str, 'source': str, 'title': str
+    'id': str, 'words': str, 'country': str,
+    'genre': 'category', 'source': str, 'title': str
 }
 DTYPES_MERGED: Dict[str, Any] = {**DTYPES_CONTENT, **DTYPES_SOURCES}
 
@@ -243,10 +243,11 @@ def parse_sources_file(sources_file: str) -> pd.DataFrame:
     for line in lines:
         line = line.strip()
         if not line: continue
+        
         parts = line.split(maxsplit=5)
         if len(parts) == 6:
-            sources_data.append({'id': parts[0], 'year': parts[1], 'type': parts[2],
-                                 'subgenre_id': parts[3], 'source': parts[4], 'title': parts[5]})
+            sources_data.append({'id': parts[0], 'words': parts[1], 'country': parts[2],
+                               'genre': parts[3], 'source': parts[4], 'title': parts[5]})
         else:
             logger.warning(f"Skipping malformed line in sources: '{line[:80]}...'")
 
@@ -286,7 +287,7 @@ def process_single_file(file_info_tuple: Tuple[str, str, int, int]) -> Tuple[boo
 
         for line_num, line in enumerate(content):
             line_stripped = line.strip()
-            if line_stripped.startswith('@@'):
+            if line_stripped.startswith('##'):
                 sequence_counter += 1
                 result_lines.append({
                     'line': line_stripped,
@@ -717,7 +718,7 @@ def merge_data(content_df: pd.DataFrame, sources_df: pd.DataFrame) -> pd.DataFra
 @cython.wraparound(False)
 def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     if merged_df.empty: return []
-    cdef list required_cols = ['content', 'source', 'year', 'title', 'id']
+    cdef list required_cols = ['content', 'source', 'country', 'title', 'id']
     if not all(col in merged_df.columns for col in required_cols):
         logger.error(f"Missing columns for formatting: {set(required_cols) - set(merged_df.columns)}")
         return []
@@ -725,7 +726,7 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     logger.info(f"Formatting {len(merged_df)} rows for validation structure...")
     cdef list validation_format = []
     cdef object row # Use object for itertuples result
-    cdef str content_val, source_val, year_val, title_val, gpt_response
+    cdef str content_val, source_val, country_val, title_val, gpt_response
     cdef list conversation
 
     try:
@@ -733,12 +734,12 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
         for row in merged_df.itertuples(index=False):
             content_val = str(getattr(row, 'content', ''))
             source_val = str(getattr(row, 'source', 'unknown_source'))
-            year_val = str(getattr(row, 'year', 'unknown_year'))
+            country_val = str(getattr(row, 'country', 'unknown_country'))
             title_val = str(getattr(row, 'title', 'unknown_title')).strip()
 
-            gpt_response = (f"Source Context: Title='{title_val}', Year='{year_val}', Source ID='{source_val}'. "
+            gpt_response = (f"The sample you provided appears to come from the country {country_val}. "
                             f"Task: Identify the dialect of the provided text, give additional context about it, and learn the dialect.")
-            conversation = [{"from": "human", "value": content_val},
+            conversation = [{"from": "human", "value": "Given the following example text, identify the dialect of the speaker: " + content_val },
                             {"from": "gpt", "value": gpt_response}]
             validation_format.append({"conversations": conversation, "source": source_val, "score": 0})
         logger.info(f"Formatted {len(validation_format)} records.")
