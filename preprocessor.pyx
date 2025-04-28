@@ -58,8 +58,8 @@ DTYPES_CONTENT: Dict[str, Any] = {
     'file_order': np.uint32, 'line_num': np.uint32, 'sequence': np.int64
 }
 DTYPES_SOURCES: Dict[str, Any] = {
-    'id': str, 'words': str, 'country': str,
-    'genre': 'category', 'source': str, 'title': str
+    'id': str, 'words': str, 'genre': 'category', 'year': str,
+    'source': str, 'title': str, 'pubInfo': str
 }
 DTYPES_MERGED: Dict[str, Any] = {**DTYPES_CONTENT, **DTYPES_SOURCES}
 
@@ -268,10 +268,17 @@ def parse_sources_file(sources_file: str) -> pd.DataFrame:
         line = line.strip()
         if not line: continue
         
-        parts = line.split(maxsplit=5)
-        if len(parts) == 6:
-            sources_data.append({'id': parts[0], 'words': parts[1], 'country': parts[2],
-                               'genre': parts[3], 'source': parts[4], 'title': parts[5]})
+        parts = line.split(maxsplit=6)
+        if len(parts) >= 7:  # Need at least 7 parts for the new structure
+            sources_data.append({
+                'id': parts[0], 
+                'words': parts[1], 
+                'genre': parts[2],
+                'year': parts[3],      # Changed from 'country' to 'year'
+                'source': parts[4], 
+                'title': parts[5],
+                'pubInfo': parts[6]    # Added new 'pubInfo' field
+            })
         else:
             logger.warning(f"Skipping malformed line in sources: '{line[:80]}...'")
 
@@ -311,7 +318,7 @@ def process_single_file(file_info_tuple: Tuple[str, str, int, int]) -> Tuple[boo
 
         for line_num, line in enumerate(content):
             line_stripped = line.strip()
-            if line_stripped.startswith('##'):
+            if line_stripped.startswith('@@'):
                 sequence_counter += 1
                 result_lines.append({
                     'line': line_stripped,
@@ -771,7 +778,7 @@ def merge_data(content_df: pd.DataFrame, sources_df: pd.DataFrame) -> pd.DataFra
 @cython.wraparound(False)
 def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
     if merged_df.empty: return []
-    cdef list required_cols = ['content', 'source', 'country', 'title', 'id']
+    cdef list required_cols = ['content', 'source', 'year', 'title', 'id']
     if not all(col in merged_df.columns for col in required_cols):
         logger.error(f"Missing columns for formatting: {set(required_cols) - set(merged_df.columns)}")
         return []
@@ -804,19 +811,11 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
                 # Start building gpt_response
                 gpt_response = "The sample you provided "
                 
-                # Add country info if available
-                if hasattr(row, 'country') and getattr(row, 'country') and str(getattr(row, 'country')) != 'nan':
-                    country_val = str(getattr(row, 'country'))
-                    gpt_response += f"appears to come from {country_val}"
-                
-                # Add title info if available
-                if hasattr(row, 'title') and getattr(row, 'title') and str(getattr(row, 'title')).strip() != 'nan':
-                    title_val = str(getattr(row, 'title')).strip()
-                    if "come from" in gpt_response:
-                        gpt_response += f" and has the title '{title_val}'"
-                    else:
-                        gpt_response += f"has the title '{title_val}'"
-                
+                # Add year info if available
+                if hasattr(row, 'year') and getattr(row, 'year') and str(getattr(row, 'year')) != 'nan':
+                    year_val = str(getattr(row, 'year'))
+                    gpt_response += f"appears to be from {year_val}"
+            
                 # Add source info if available
                 source_val = str(getattr(row, 'source', 'unknown_source'))
                 
@@ -826,7 +825,8 @@ def format_for_validation(merged_df: pd.DataFrame) -> List[Dict[str, Any]]:
                 
                 # Create conversation structure
                 conversation = [
-                    {"from": "human", "value": "Given the following example text, identify the dialect of the speaker: " + content_val},
+                    {"from": "human", "value": 
+                    "Given the following example text, use dialectal markers to identify the country of origin: " + content_val},
                     {"from": "gpt", "value": gpt_response}
                 ]
                 
